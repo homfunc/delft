@@ -342,7 +342,8 @@ class Sequence(object):
                 char_embed_size=self.model_config.char_embedding_size,
                 max_sequence_length=self.model_config.max_sequence_length,
                 embeddings=self.embeddings, shuffle=False, features=features,
-                output_input_offsets=True, use_chain_crf=self.model_config.use_chain_crf)
+                output_input_offsets=True, use_chain_crf=self.model_config.use_chain_crf,
+                pad_to_max_sequence_length=False)
 
             # Build the evaluator and evaluate the model
             scorer = Scorer(test_generator, self.p, evaluation=True, use_crf=self.model_config.use_crf,

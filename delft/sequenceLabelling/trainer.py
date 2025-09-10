@@ -187,6 +187,7 @@ class Trainer(object):
                     max_sequence_length=gen_max_seq_len,
                     embeddings=self.embeddings, 
                     shuffle=True, features=f_train, use_chain_crf=self.model_config.use_chain_crf,
+                    pad_to_max_sequence_length=True,
                     crf_loss_only_outputs=loss_only)
 
                 validation_generator = generator(x_valid, y_valid,  
@@ -196,6 +197,7 @@ class Trainer(object):
                     max_sequence_length=gen_max_seq_len,
                     embeddings=self.embeddings, shuffle=False, features=f_valid, 
                     output_input_offsets=True, use_chain_crf=self.model_config.use_chain_crf,
+                    pad_to_max_sequence_length=True,
                     crf_loss_only_outputs=loss_only)
 
                 _callbacks = get_callbacks(
@@ -226,6 +228,7 @@ class Trainer(object):
                     max_sequence_length=gen_max_seq_len,
                     embeddings=self.embeddings, shuffle=True, 
                     features=feature_all, use_chain_crf=self.model_config.use_chain_crf,
+                    pad_to_max_sequence_length=True,
                     crf_loss_only_outputs=loss_only)
 
                 _callbacks = get_callbacks(
