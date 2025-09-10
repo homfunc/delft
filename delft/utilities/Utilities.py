@@ -10,8 +10,6 @@ import shutil
 import requests
 from urllib.parse import urlparse
 
-from tensorflow.keras.preprocessing import text
-
 from tqdm import tqdm 
 
 import argparse
@@ -168,10 +166,27 @@ def generateOOVEmbeddings():
     list_sentences_test = test_df["comment_text"].values
     list_sentences_all = np.concatenate([list_sentences_train, list_sentences_test])
 
-    tokenizer = text.Tokenizer(num_words=400000)
-    tokenizer.fit_on_texts(list(list_sentences_all))
-    print('word_index size:', len(tokenizer.word_index), 'words')
-    word_index = tokenizer.word_index
+    # Lazily import a Tokenizer; prefer standalone Keras, fallback to tf.keras; else use a simple whitespace tokenizer
+    try:
+        from keras.preprocessing import text as keras_text  # May be unavailable in Keras 3
+    except Exception:
+        try:
+            from tensorflow.keras.preprocessing import text as keras_text  # Fallback if TF is installed
+        except Exception:
+            keras_text = None
+
+    if keras_text is not None:
+        tokenizer = keras_text.Tokenizer(num_words=400000)
+        tokenizer.fit_on_texts(list(list_sentences_all))
+        print('word_index size:', len(tokenizer.word_index), 'words')
+        word_index = tokenizer.word_index
+    else:
+        print('Warning: Keras Tokenizer not available; using basic whitespace tokenization.')
+        word_index = {}
+        for s in list_sentences_all:
+            for w in str(s).split():
+                if w not in word_index:
+                    word_index[w] = len(word_index) + 1
 
     # load fastText - only the words
     print('loading fastText embeddings...')

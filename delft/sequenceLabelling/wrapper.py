@@ -1,4 +1,5 @@
 import os
+import shutil
 
 from packaging import version
 
@@ -23,12 +24,15 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-import tensorflow as tf
-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
-tf.get_logger().setLevel('ERROR')
-
-from tensorflow.python.util import deprecation
-deprecation._PRINT_DEPRECATION_WARNINGS = False
+# Optional TensorFlow-only logging control (when TF backend is in use)
+try:
+    import tensorflow as tf  # type: ignore
+    tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
+    tf.get_logger().setLevel('ERROR')
+    from tensorflow.python.util import deprecation  # type: ignore
+    deprecation._PRINT_DEPRECATION_WARNINGS = False
+except Exception:
+    tf = None  # TensorFlow not available; continue without TF-specific logging tweaks
 
 # unfortunately when running in graph mode, we cannot use BERT pre-trained, 
 # see https://github.com/huggingface/transformers/issues/3086
@@ -53,6 +57,8 @@ from delft.utilities.Embeddings import Embeddings, load_resource_registry
 from delft.utilities.numpy import concatenate_or_none
 
 from delft.sequenceLabelling.evaluation import classification_report
+
+# --- utilities ---
 
 import transformers
 transformers.logging.set_verbosity(transformers.logging.ERROR)
@@ -197,6 +203,8 @@ class Sequence(object):
 
         # TBD if valid is None, segment train to get one if early_stop is True
         if multi_gpu:
+            if tf is None:
+                raise RuntimeError('Multi-GPU support requires the TensorFlow backend to be available.')
             strategy = tf.distribute.MirroredStrategy()
             print('Running with multi-gpu. Number of devices: {}'.format(strategy.num_replicas_in_sync))
 
@@ -267,6 +275,8 @@ class Sequence(object):
 
     def train_nfold(self, x_train, y_train, x_valid=None, y_valid=None, f_train=None, f_valid=None, incremental=False, callbacks=None, multi_gpu=False):
         if multi_gpu:
+            if tf is None:
+                raise RuntimeError('Multi-GPU support requires the TensorFlow backend to be available.')
             strategy = tf.distribute.MirroredStrategy()
             print('Running with multi-gpu. Number of devices: {}'.format(strategy.num_replicas_in_sync))
 
@@ -336,8 +346,7 @@ class Sequence(object):
 
             # Build the evaluator and evaluate the model
             scorer = Scorer(test_generator, self.p, evaluation=True, use_crf=self.model_config.use_crf,
-                use_chain_crf=self.model_config.use_chain_crf)
-            scorer.model = self.model
+                use_chain_crf=self.model_config.use_chain_crf, bound_model=self.model)
             scorer.on_epoch_end(epoch=-1)
         else:
             # the architecture model uses a transformer layer
@@ -403,13 +412,19 @@ class Sequence(object):
                 else:
                     # the architecture model uses a transformer layer, it is large and needs to be loaded from disk
                     dir_path = 'data/models/sequenceLabelling/'
-                    weight_file = DEFAULT_WEIGHT_FILE_NAME.replace(".hdf5", str(i)+".hdf5")
+                    # prefer per-fold native Keras file if available
+                    keras_fold_file = os.path.join(dir_path, self.model_config.model_name, f"model{i}.keras")
+                    if os.path.exists(keras_fold_file):
+                        fold_path = keras_fold_file
+                    else:
+                        weight_file = DEFAULT_WEIGHT_FILE_NAME.replace(".hdf5", str(i)+".hdf5")
+                        fold_path = os.path.join(dir_path, self.model_config.model_name, weight_file)
                     self.model = get_model(self.model_config,
                                self.p,
                                ntags=len(self.p.vocab_tag),
                                load_pretrained_weights=False,
                                local_path= os.path.join(dir_path, self.model_config.model_name))
-                    self.model.load(filepath=os.path.join(dir_path, self.model_config.model_name, weight_file))
+                    self.model.load(filepath=fold_path)
                     the_model = self.model
                     bert_preprocessor = self.model.transformer_preprocessor
 
@@ -435,8 +450,8 @@ class Sequence(object):
                                 self.p,
                                 evaluation=True,
                                 use_crf=self.model_config.use_crf,
-                                use_chain_crf=self.model_config.use_chain_crf)
-                scorer.model = the_model
+                                use_chain_crf=self.model_config.use_chain_crf,
+                                bound_model=the_model)
                 scorer.on_epoch_end(epoch=-1)
                 f1 = scorer.f1
                 precision = scorer.precision
@@ -523,6 +538,8 @@ class Sequence(object):
 
     def tag(self, texts, output_format, features=None, batch_size=None, multi_gpu=False):
         if multi_gpu:
+            if tf is None:
+                raise RuntimeError('Multi-GPU support requires the TensorFlow backend to be available.')
             strategy = tf.distribute.MirroredStrategy()
             print('Running with multi-gpu. Number of devices: {}'.format(strategy.num_replicas_in_sync))
 
@@ -661,7 +678,7 @@ class Sequence(object):
         else:
             raise (OSError('Could not find a model.'))
 
-    def save(self, dir_path='data/models/sequenceLabelling/', weight_file=DEFAULT_WEIGHT_FILE_NAME):
+    def save(self, dir_path='data/models/sequenceLabelling/', weight_file=DEFAULT_WEIGHT_FILE_NAME, export_hdf5: bool = False):
         # create subfolder for the model if not already exists
         directory = os.path.join(dir_path, self.model_config.model_name)
         if not os.path.exists(directory):
@@ -676,7 +693,73 @@ class Sequence(object):
         if self.model is None and self.model_config.fold_number > 1:
             print('Error: model not saved. Evaluation need to be called first to select the best fold model to be saved')
         else:
-            self.model.save(os.path.join(directory, weight_file))
+            # Default: save native Keras model for Keras 3
+            keras_path = os.path.join(directory, 'model.keras')
+            # Underlying Keras model (functional or subclassed)
+            target_model = getattr(self.model, 'model', self.model)
+            # Ensure variables are created (for subclassed wrappers)
+            try:
+                build_cfg_fn = getattr(target_model, 'get_build_config', None)
+                build_from_cfg_fn = getattr(target_model, 'build_from_config', None)
+                if callable(build_cfg_fn) and callable(build_from_cfg_fn):
+                    cfg = build_cfg_fn()
+                    build_from_cfg_fn(cfg)
+            except Exception as be:
+                print(f"Warning: symbolic build before save failed: {be}")
+                # Fallback: run a tiny eager forward pass to materialize variables
+                try:
+                    import numpy as _np
+                    dummy_inputs = []
+                    base = getattr(target_model, 'base_model', None)
+                    if base is not None and getattr(base, 'inputs', None):
+                        # Use base_model input specs
+                        for inp in base.inputs:
+                            shp = [1] + [1 if d is None else int(d) for d in inp.shape[1:]]
+                            dt = str(inp.dtype)
+                            arr = _np.zeros(tuple(shp), dtype='int32' if 'int' in dt else 'float32')
+                            dummy_inputs.append(arr)
+                        _ = target_model(dummy_inputs, training=False)
+                    else:
+                        # Use target_model build config if available
+                        cfg = None
+                        if callable(build_cfg_fn):
+                            try:
+                                cfg = build_cfg_fn()
+                            except Exception:
+                                cfg = None
+                        specs = list((cfg or {}).get('input_specs', []))
+                        if specs:
+                            for s in specs:
+                                shape = (1,) + tuple(1 if d is None else int(d) for d in s.get('shape', ()))
+                                dt = s.get('dtype', 'float32')
+                                arr = _np.zeros(shape, dtype='int32' if 'int' in str(dt) else 'float32')
+                                dummy_inputs.append(arr)
+                            _ = target_model(dummy_inputs, training=False)
+                        else:
+                            # Last-resort heuristic for common sequence models
+                            mc = getattr(self.model, 'config', getattr(self, 'model_config', None))
+                            we = int(getattr(mc, 'word_embedding_size', 32) or 32)
+                            max_char = int(getattr(mc, 'max_char_length', 10) or 10)
+                            dummy_inputs = [
+                                _np.zeros((1, 1, we), dtype='float32'),
+                                _np.zeros((1, 1, max_char), dtype='int32'),
+                                _np.zeros((1, 1), dtype='int32'),
+                            ]
+                            try:
+                                _ = target_model(dummy_inputs, training=False)
+                            except Exception:
+                                pass
+                except Exception as ee:
+                    print(f"Warning: eager warm-up before save failed: {ee}")
+            target_model.save(keras_path)
+            # Save as-is; do not rename CRF variable paths post-save.
+            print('model saved to', keras_path)
+
+            # Optionally export legacy HDF5 weights for external tooling
+            if export_hdf5 and weight_file:
+                h5_path = os.path.join(directory, weight_file)
+                self.model.save_weights(h5_path)
+                print('legacy weights saved to', h5_path)
 
             # save pretrained transformer config if used in the model
             if self.model.transformer_config is not None:
@@ -687,20 +770,18 @@ class Sequence(object):
                 self.model.transformer_preprocessor.tokenizer.save_pretrained(os.path.join(directory, DEFAULT_TRANSFORMER_TOKENIZER_DIR))
                 print('transformer tokenizer saved')
 
-        print('model saved')
-
-    def load(self, dir_path='data/models/sequenceLabelling/', weight_file=DEFAULT_WEIGHT_FILE_NAME):
+    def load(self, dir_path='data/models/sequenceLabelling/', weight_file=DEFAULT_WEIGHT_FILE_NAME, skip_embeddings: bool = False):
         model_path = os.path.join(dir_path, self.model_config.model_name)
         self.model_config = ModelConfig.load(os.path.join(model_path, CONFIG_FILE_NAME))
 
-        if self.model_config.embeddings_name is not None:
+        if self.model_config.embeddings_name is not None and not skip_embeddings:
             # load embeddings
             # Do not use cache in 'prediction/production' mode
             self.embeddings = Embeddings(self.model_config.embeddings_name, resource_registry=self.registry, use_ELMo=self.model_config.use_ELMo, use_cache=False)
             self.model_config.word_embedding_size = self.embeddings.embed_size
         else:
+            # keep the embedding size stored in the saved config; do not override when skipping
             self.embeddings = None
-            self.model_config.word_embedding_size = 0
 
         self.p = Preprocessor.load(os.path.join(dir_path, self.model_config.model_name, PROCESSOR_FILE_NAME))
         self.model = get_model(self.model_config,
@@ -708,8 +789,45 @@ class Sequence(object):
                                ntags=len(self.p.vocab_tag),
                                load_pretrained_weights=False,
                                local_path=os.path.join(dir_path, self.model_config.model_name))
-        print("load weights from", os.path.join(dir_path, self.model_config.model_name, weight_file))
-        self.model.load(filepath=os.path.join(dir_path, self.model_config.model_name, weight_file))
+        # Prefer native Keras model if present
+        keras_model_path = os.path.join(dir_path, self.model_config.model_name, 'model.keras')
+        legacy_path = os.path.join(dir_path, self.model_config.model_name, weight_file)
+        load_path = None
+        if os.path.exists(keras_model_path):
+            load_path = keras_model_path
+            print("load weights from", load_path)
+            try:
+                self.model.load(filepath=load_path)
+            except Exception as e:
+                print(f"Loading {load_path} failed ({e}); falling back to legacy weights if available")
+                if os.path.exists(legacy_path):
+                    load_path = legacy_path
+                    print("load weights from", load_path)
+                    self.model.load(filepath=load_path)
+                    # Ensure CRF variables are created without data warm-up (symbolic build)
+                    try:
+                        build_cfg_fn = getattr(self.model.model, 'get_build_config', None)
+                        build_from_cfg_fn = getattr(self.model.model, 'build_from_config', None)
+                        if callable(build_cfg_fn) and callable(build_from_cfg_fn):
+                            cfg = build_cfg_fn()
+                            build_from_cfg_fn(cfg)
+                    except Exception as be:
+                        print(f"Warning: symbolic build before save failed: {be}")
+                    # Overwrite any existing .keras with a fresh, safe model (ensures CRF vars saved)
+                    try:
+                        if os.path.exists(keras_model_path):
+                            os.remove(keras_model_path)
+                        target_model = getattr(self.model, 'model', self.model)
+                        target_model.save(keras_model_path)
+                        print(f"Re-saved safe model to {keras_model_path}")
+                    except Exception as se2:
+                        print(f"Warning: could not overwrite {keras_model_path}: {se2}")
+                else:
+                    raise
+        else:
+            load_path = legacy_path
+            print("load weights from", load_path)
+            self.model.load(filepath=load_path)
         self.model.print_summary()
 
 def next_n_lines(file_opened, N):

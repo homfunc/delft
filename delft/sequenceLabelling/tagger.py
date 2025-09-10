@@ -1,7 +1,11 @@
 import datetime
 
 import numpy as np
-import tensorflow as tf
+# Optional: only needed for multi-GPU via TensorFlow
+try:
+    import tensorflow as tf  # type: ignore
+except Exception:
+    tf = None
 from packaging import version
 
 from delft.sequenceLabelling.data_generator import DataGeneratorTransformers
@@ -26,6 +30,8 @@ class Tagger(object):
 
     def tag(self, texts, output_format, features=None, multi_gpu=False):
         if multi_gpu:
+            if tf is None:
+                raise RuntimeError('Multi-GPU support requires the TensorFlow backend to be available.')
             strategy = tf.distribute.MirroredStrategy()
             print('Running with multi-gpu. Number of devices: {}'.format(strategy.num_replicas_in_sync))
 
@@ -85,13 +91,13 @@ class Tagger(object):
             features=features, output_input_offsets=True, 
             use_chain_crf=self.model_config.use_chain_crf)
 
-        steps_done = 0
         steps = len(predict_generator)
-        for generator_output in predict_generator:
-            if dummy_case and steps_done == 1:
-                break
+        for batch_idx in range(steps):
+            # fetch the batch deterministically to avoid over-indexing past the number of steps
+            generator_output = predict_generator[batch_idx]
 
-            if steps_done == steps:
+            # if we added a dummy second sequence and already processed the first real batch, stop
+            if dummy_case and batch_idx == 1:
                 break
 
             if isinstance(predict_generator, DataGeneratorTransformers):
@@ -133,7 +139,8 @@ class Tagger(object):
 
             for i in range(0, len(preds)):
                 pred = [preds[i]]
-                text = texts[i+(steps_done*self.model_config.batch_size)]
+                base_index = batch_idx * self.model_config.batch_size
+                text = texts[i + base_index]
 
                 if to_tokeniz:
                    tokens, offsets = tokenizeAndFilter(text)
@@ -158,7 +165,6 @@ class Tagger(object):
                 else:
                     the_tags = list(zip(tokens, tags))
                     list_of_tags.append(the_tags)
-            steps_done += 1
 
         if output_format == 'json':
             return res

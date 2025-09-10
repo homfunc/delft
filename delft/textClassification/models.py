@@ -3,11 +3,11 @@ import os
 
 import numpy as np
 from sklearn.metrics import log_loss, roc_auc_score, r2_score
-from tensorflow.keras.layers import Dense, Input, concatenate
-from tensorflow.keras.layers import GRU, MaxPooling1D, Conv1D, GlobalMaxPool1D, Activation, Add, Flatten
-from tensorflow.keras.layers import LSTM, Bidirectional, Dropout, GlobalAveragePooling1D
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import RMSprop
+from keras.layers import Dense, Input, concatenate
+from keras.layers import GRU, MaxPooling1D, Conv1D, GlobalMaxPool1D, Activation, Add, Flatten
+from keras.layers import LSTM, Bidirectional, Dropout, GlobalAveragePooling1D
+from keras.models import Model
+from keras.optimizers import RMSprop
 from transformers import create_optimizer
 
 from delft.textClassification.data_generator import DataGenerator

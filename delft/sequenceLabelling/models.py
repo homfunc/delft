@@ -1,18 +1,27 @@
-from tensorflow.keras.layers import Dense, LSTM, GRU, Bidirectional, Embedding, Input, Dropout, Reshape
-from tensorflow.keras.layers import GlobalMaxPooling1D, TimeDistributed, Conv1D
-from tensorflow.keras.layers import Concatenate
-from tensorflow.keras.models import Model
-from tensorflow.keras.models import clone_model
+import os
+import keras
+
+from keras.layers import Dense, LSTM, GRU, Bidirectional, Embedding, Input, Dropout, Reshape
+from keras.layers import GlobalMaxPooling1D, TimeDistributed, Conv1D
+from keras.layers import Concatenate, Lambda
+from keras.models import Model
+from keras.models import clone_model
+from keras import ops as K
+from keras.saving import register_keras_serializable
 
 from delft.sequenceLabelling.config import ModelConfig
 from delft.sequenceLabelling.preprocess import Preprocessor, BERTPreprocessor
 from delft.utilities.Transformer import Transformer
 from delft.utilities.crf_wrapper_default import CRFModelWrapperDefault
 from delft.utilities.crf_wrapper_for_bert import CRFModelWrapperForBERT
+from delft.utilities.layers import TakeFirst, ApplyLengthMask, PassMask, ComputeCharLengths, GatherAtIndex
 
-from delft.utilities.crf_layer import ChainCRF
-from delft.sequenceLabelling.data_generator import DataGenerator, DataGeneratorTransformers
+from delft.sequenceLabelling.data_generator import DataGenerator, DataGeneratorTransformers, DataGeneratorCRFTagger
 from delft.utilities.Embeddings import load_resource_registry
+
+# CRF layer and losses (Keras 3 backend-agnostic)
+from keras_crf.layers import CRF as KCRF
+from keras_crf.losses import nll_loss as crf_nll_loss, dice_loss as crf_dice_loss, joint_dice_nll_loss as crf_joint_loss
 
 """
 The sequence labeling models.
@@ -42,12 +51,13 @@ def get_model(config: ModelConfig, preprocessor, ntags=None, load_pretrained_wei
         config.use_crf = True
         return BidLSTM_CRF(config, ntags)
 
+
     elif config.architecture == BidLSTM_ChainCRF.name:
         preprocessor.return_word_embeddings = True
         preprocessor.return_chars = True
         preprocessor.return_lengths = True
         config.use_crf = True
-        config.use_chain_crf = True
+        # chain implementation now uses CRF wrapper; do not mark use_chain_crf
         return BidLSTM_ChainCRF(config, ntags)
 
     elif config.architecture == BidLSTM_CNN.name:
@@ -86,7 +96,6 @@ def get_model(config: ModelConfig, preprocessor, ntags=None, load_pretrained_wei
         preprocessor.return_chars = True
         preprocessor.return_lengths = True
         config.use_crf = True
-        config.use_chain_crf = True
         return BidLSTM_ChainCRF_FEATURES(config, ntags)
 
     elif config.architecture == BidLSTM_CRF_CASING.name:
@@ -129,7 +138,6 @@ def get_model(config: ModelConfig, preprocessor, ntags=None, load_pretrained_wei
     elif config.architecture == BERT_ChainCRF.name:
         preprocessor.return_bert_embeddings = True
         config.use_crf = True
-        config.use_chain_crf = True
         config.labels = preprocessor.vocab_tag
         return BERT_ChainCRF(config, 
                         ntags, 
@@ -152,7 +160,6 @@ def get_model(config: ModelConfig, preprocessor, ntags=None, load_pretrained_wei
         preprocessor.return_bert_embeddings = True
         preprocessor.return_features = True
         config.use_crf = True
-        config.use_chain_crf = True
         config.labels = preprocessor.vocab_tag
         return BERT_ChainCRF_FEATURES(config, 
                                 ntags, 
@@ -227,7 +234,50 @@ class BaseModel(object):
 
     def load(self, filepath):
         print('loading model weights', filepath)
-        self.model.load_weights(filepath=filepath)
+        # If a native Keras model file is provided, load it directly
+        if filepath.endswith('.keras'):
+            from keras.models import load_model
+            loaded = load_model(filepath)
+            self.model = loaded
+            return
+
+        # Try standard loader first
+        converted_path = None
+        try:
+            self.model.load_weights(filepath=filepath)
+            converted_path = self._maybe_autoconvert(filepath)
+            if converted_path:
+                print(f"Converted legacy weights to {converted_path}")
+            return
+        except Exception as e:
+            print('Standard load_weights failed, attempting legacy HDF5 by-name loading:', e)
+            try:
+                from delft.utilities.weights import load_weights_by_name_from_h5
+                load_weights_by_name_from_h5(self.model, filepath)
+                converted_path = self._maybe_autoconvert(filepath)
+                if converted_path:
+                    print(f"Converted legacy weights to {converted_path}")
+            except Exception as ee:
+                print('Legacy loader failed:', ee)
+                raise
+
+    def _maybe_autoconvert(self, legacy_weights_path: str):
+        # Save a native Keras model next to the legacy weights for faster future loads
+        model_dir = os.path.dirname(legacy_weights_path)
+        keras_path = os.path.join(model_dir, 'model.keras')
+        if not os.path.exists(keras_path):
+            try:
+                # Try to symbolically build variables for subclassed models (e.g., CRF wrapper)
+                build_cfg_fn = getattr(self.model, 'get_build_config', None)
+                build_from_cfg_fn = getattr(self.model, 'build_from_config', None)
+                if callable(build_cfg_fn) and callable(build_from_cfg_fn):
+                    cfg = build_cfg_fn()
+                    build_from_cfg_fn(cfg)
+                self.model.save(keras_path)
+                return keras_path
+            except Exception as e:
+                print('Warning: could not auto-convert to .keras:', e)
+        return None
 
     def __getattr__(self, name):
         return getattr(self.model, name)
@@ -238,13 +288,21 @@ class BaseModel(object):
         return model_copy
 
     def get_generator(self):
+        # If model expects 'labels' input (CRF tagger style), use the dedicated generator
+        try:
+            input_names = [getattr(i, 'name').split(':')[0] for i in self.model.inputs]
+            if 'labels' in input_names:
+                return DataGeneratorCRFTagger
+        except Exception:
+            pass
         # default generator
         return DataGenerator
 
     def print_summary(self):
-        if hasattr(self.model, 'base_model'):
-            self.model.base_model.summary()
-        self.model.summary()
+        base = getattr(self.model, 'base_model', None)
+        if base is not None:
+            base.summary(expand_nested=True)
+        self.model.summary(expand_nested=True)
 
     def init_transformer(self, config: ModelConfig, 
                          load_pretrained_weights: bool, 
@@ -284,7 +342,40 @@ class BidLSTM(BaseModel):
                                     name='char_embeddings'
                                     ))(char_input)
 
-        chars = TimeDistributed(Bidirectional(LSTM(config.num_char_lstm_units, return_sequences=False)))(char_embeddings)
+        # Compute per-token char lengths from char_input and build explicit per-token char representation
+        char_lengths = ComputeCharLengths(name='char_lengths')(char_input)
+        # Forward and backward char LSTMs with full sequences
+        f_seq = TimeDistributed(LSTM(
+            config.num_char_lstm_units,
+            return_sequences=True,
+            activation='tanh',
+            recurrent_activation='sigmoid',
+            use_bias=True,
+            unit_forget_bias=True,
+            kernel_initializer='glorot_uniform',
+            recurrent_initializer='orthogonal',
+            bias_initializer='zeros',
+            implementation=1,
+            recurrent_dropout=0.0,
+        ), name='char_lstm_fwd')(char_embeddings)
+        b_seq = TimeDistributed(LSTM(
+            config.num_char_lstm_units,
+            return_sequences=True,
+            go_backwards=True,
+            activation='tanh',
+            recurrent_activation='sigmoid',
+            use_bias=True,
+            unit_forget_bias=True,
+            kernel_initializer='glorot_uniform',
+            recurrent_initializer='orthogonal',
+            bias_initializer='zeros',
+            implementation=1,
+            recurrent_dropout=0.0,
+        ), name='char_lstm_bwd')(char_embeddings)
+        # Gather last valid forward step and first backward step
+        f_last = GatherAtIndex(name='char_f_last')([f_seq, K.maximum(char_lengths - 1, 0)])
+        b_first = GatherAtIndex(name='char_b_first')([b_seq, K.zeros_like(char_lengths)])
+        chars = keras.layers.Concatenate(name='char_repr')([f_last, b_first])
 
         # length of sequence not used by the model, but used by the training scorer
         length_input = Input(batch_shape=(None, 1), dtype='int32', name='length_input')
@@ -297,6 +388,8 @@ class BidLSTM(BaseModel):
                                return_sequences=True,
                                recurrent_dropout=config.recurrent_dropout))(x)
         x = Dropout(config.dropout)(x)
+        # Attach a per-token mask derived from sequence lengths (keeps length_input in graph)
+        x = ApplyLengthMask(name="length_mask")([x, length_input])
         pred = Dense(ntags, activation='softmax')(x)
 
         self.model = Model(inputs=[word_input, char_input, length_input], outputs=[pred])
@@ -331,7 +424,60 @@ class BidLSTM_CRF(BaseModel):
                                     name='char_embeddings'
                                     ))(char_input)
 
-        chars = TimeDistributed(Bidirectional(LSTM(config.num_char_lstm_units, return_sequences=False)))(char_embeddings)
+        # Two modes for parity vs. deterministic char representation
+        import os as _os
+        if _os.environ.get('DELFT_PARITY_LEGACY_CHAR') == '1':
+            # Legacy semantics to match original tf.keras behavior under masking
+            chars = TimeDistributed(
+                Bidirectional(LSTM(config.num_char_lstm_units,
+                                   return_sequences=False,
+                                   activation='tanh',
+                                   recurrent_activation='sigmoid',
+                                   use_bias=True,
+                                   unit_forget_bias=True,
+                                   kernel_initializer='glorot_uniform',
+                                   recurrent_initializer='orthogonal',
+                                   bias_initializer='zeros',
+                                   implementation=1,
+                                   recurrent_dropout=0.0),
+                               name='char_bilstm'),
+                name='time_distributed_1')(char_embeddings)
+        else:
+            # Deterministic, backend-stable path
+            # Compute per-token char lengths from char_input and build explicit per-token char representation
+            char_lengths = ComputeCharLengths(name='char_lengths')(char_input)
+            # Forward and backward char LSTMs with full sequences
+            f_seq = TimeDistributed(LSTM(
+                config.num_char_lstm_units,
+                return_sequences=True,
+                activation='tanh',
+                recurrent_activation='sigmoid',
+                use_bias=True,
+                unit_forget_bias=True,
+                kernel_initializer='glorot_uniform',
+                recurrent_initializer='orthogonal',
+                bias_initializer='zeros',
+                implementation=1,
+                recurrent_dropout=0.0,
+            ), name='char_lstm_fwd')(char_embeddings)
+            b_seq = TimeDistributed(LSTM(
+                config.num_char_lstm_units,
+                return_sequences=True,
+                go_backwards=True,
+                activation='tanh',
+                recurrent_activation='sigmoid',
+                use_bias=True,
+                unit_forget_bias=True,
+                kernel_initializer='glorot_uniform',
+                recurrent_initializer='orthogonal',
+                bias_initializer='zeros',
+                implementation=1,
+                recurrent_dropout=0.0,
+            ), name='char_lstm_bwd')(char_embeddings)
+            # Gather last valid forward step and first backward step
+            f_last = GatherAtIndex(name='char_f_last')([f_seq, K.maximum(char_lengths - 1, 0)])
+            b_first = GatherAtIndex(name='char_b_first')([b_seq, K.zeros_like(char_lengths)])
+            chars = keras.layers.Concatenate(name='char_repr')([f_last, b_first])
 
         # length of sequence not used by the model, but used by the training scorer
         length_input = Input(batch_shape=(None, 1), dtype='int32', name='length_input')
@@ -345,13 +491,25 @@ class BidLSTM_CRF(BaseModel):
                                recurrent_dropout=config.recurrent_dropout))(x)
         x = Dropout(config.dropout)(x)
         x = Dense(config.num_word_lstm_units, activation='tanh')(x)
+        # Attach a per-token mask derived from sequence lengths (keeps length_input in graph)
+        x = ApplyLengthMask(name="length_mask")([x, length_input])
 
         base_model = Model(inputs=[word_input, char_input, length_input], outputs=[x])
+        # crf_model = KCRF(ntags, name="crf", use_kernel=True)
 
-        self.model = CRFModelWrapperDefault(base_model, ntags)
+        self.model = CRFModelWrapperDefault(base_model, ntags,
+                                            loss_mode=config.crf_loss_type,
+                                            dice_smooth=config.crf_dice_smooth,
+                                            joint_nll_weight=config.crf_joint_nll_weight,
+                                            use_kernel=True,
+                                            use_boundary=config.crf_use_boundary)
         self.model.build(input_shape=[(None, None, config.word_embedding_size), (None, None, config.max_char_length), (None, None, 1)])
         #self.model.summary()
         self.config = config
+
+
+
+
 
 
 class BidLSTM_ChainCRF(BaseModel):
@@ -381,7 +539,40 @@ class BidLSTM_ChainCRF(BaseModel):
                                     name='char_embeddings'
                                     ))(char_input)
 
-        chars = TimeDistributed(Bidirectional(LSTM(config.num_char_lstm_units, return_sequences=False)))(char_embeddings)
+        # Compute per-token char lengths from char_input and build explicit per-token char representation
+        char_lengths = ComputeCharLengths(name='char_lengths')(char_input)
+        # Forward and backward char LSTMs with full sequences
+        f_seq = TimeDistributed(LSTM(
+            config.num_char_lstm_units,
+            return_sequences=True,
+            activation='tanh',
+            recurrent_activation='sigmoid',
+            use_bias=True,
+            unit_forget_bias=True,
+            kernel_initializer='glorot_uniform',
+            recurrent_initializer='orthogonal',
+            bias_initializer='zeros',
+            implementation=1,
+            recurrent_dropout=0.0,
+        ), name='char_lstm_fwd')(char_embeddings)
+        b_seq = TimeDistributed(LSTM(
+            config.num_char_lstm_units,
+            return_sequences=True,
+            go_backwards=True,
+            activation='tanh',
+            recurrent_activation='sigmoid',
+            use_bias=True,
+            unit_forget_bias=True,
+            kernel_initializer='glorot_uniform',
+            recurrent_initializer='orthogonal',
+            bias_initializer='zeros',
+            implementation=1,
+            recurrent_dropout=0.0,
+        ), name='char_lstm_bwd')(char_embeddings)
+        # Gather last valid forward step and first backward step
+        f_last = GatherAtIndex(name='char_f_last')([f_seq, K.maximum(char_lengths - 1, 0)])
+        b_first = GatherAtIndex(name='char_b_first')([b_seq, K.zeros_like(char_lengths)])
+        chars = keras.layers.Concatenate(name='char_repr')([f_last, b_first])
 
         # length of sequence not used by the model, but used by the training scorer
         length_input = Input(batch_shape=(None, 1), dtype='int32', name='length_input')
@@ -395,11 +586,17 @@ class BidLSTM_ChainCRF(BaseModel):
                                recurrent_dropout=config.recurrent_dropout))(x)
         x = Dropout(config.dropout)(x)
         x = Dense(config.num_word_lstm_units, activation='tanh')(x)
-        x = Dense(ntags)(x)
-        self.crf = ChainCRF()
-        pred = self.crf(x)
+        # Do not pre-project to ntags; the CRF layer will handle projection internally
+        # Attach a per-token mask derived from sequence lengths (keeps length_input in graph)
+        x = ApplyLengthMask(name="length_mask")([x, length_input])
 
-        self.model = Model(inputs=[word_input, char_input, length_input], outputs=[pred])
+        base_model = Model(inputs=[word_input, char_input, length_input], outputs=[x])
+        self.model = CRFModelWrapperDefault(base_model, ntags,
+                                            loss_mode=config.crf_loss_type,
+                                            dice_smooth=config.crf_dice_smooth,
+                                            joint_nll_weight=config.crf_joint_nll_weight,
+                                            use_boundary=config.crf_use_boundary)
+        self.model.build(input_shape=[(None, None, config.word_embedding_size), (None, None, config.max_char_length), (None, None, 1)])
         self.config = config
 
 
@@ -455,6 +652,8 @@ class BidLSTM_CNN(BaseModel):
                                return_sequences=True,
                                recurrent_dropout=config.recurrent_dropout))(x)
         x = Dropout(config.dropout)(x)
+        # Ensure length_input participates in the graph while leaving outputs unchanged
+        x = TakeFirst(name="length_passthrough")([x, length_input])
         #pred = TimeDistributed(Dense(ntags, activation='softmax'))(x)
         pred = Dense(ntags, activation='softmax')(x)
 
@@ -519,9 +718,17 @@ class BidLSTM_CNN_CRF(BaseModel):
                                recurrent_dropout=config.recurrent_dropout))(x)
         x = Dropout(config.dropout)(x)
         x = Dense(config.num_word_lstm_units, activation='tanh')(x)
+        # Ensure length_input participates in the graph while leaving outputs unchanged
+        x = TakeFirst(name="length_passthrough")([x, length_input])
+        # Ensure casing_input participates in the graph while leaving outputs unchanged
+        x = TakeFirst(name="casing_passthrough")([x, casing_input])
 
         base_model = Model(inputs=[word_input, char_input, casing_input, length_input], outputs=[x])
-        self.model = CRFModelWrapperDefault(base_model, ntags)
+        self.model = CRFModelWrapperDefault(base_model, ntags,
+                                            loss_mode=config.crf_loss_type,
+                                            dice_smooth=config.crf_dice_smooth,
+                                            joint_nll_weight=config.crf_joint_nll_weight,
+                                            use_boundary=config.crf_use_boundary)
         self.model.build(input_shape=[(None, None, config.word_embedding_size), (None, None, config.max_char_length), (None, None, None), (None, None, 1)])
         self.config = config
 
@@ -565,9 +772,15 @@ class BidGRU_CRF(BaseModel):
                                return_sequences=True,
                                recurrent_dropout=config.recurrent_dropout))(x)
         x = Dense(config.num_word_lstm_units, activation='tanh')(x)
+        # Ensure length_input participates in the graph while leaving outputs unchanged
+        x = TakeFirst(name="length_passthrough")([x, length_input])
 
         base_model = Model(inputs=[word_input, char_input, length_input], outputs=[x])
-        self.model = CRFModelWrapperDefault(base_model, ntags)
+        self.model = CRFModelWrapperDefault(base_model, ntags,
+                                            loss_mode=config.crf_loss_type,
+                                            dice_smooth=config.crf_dice_smooth,
+                                            joint_nll_weight=config.crf_joint_nll_weight,
+                                            use_boundary=config.crf_use_boundary)
         self.model.build(input_shape=[(None, None, config.word_embedding_size), (None, None, config.max_char_length), (None, None, 1)])
 
         self.config = config
@@ -620,9 +833,15 @@ class BidLSTM_CRF_CASING(BaseModel):
                                recurrent_dropout=config.recurrent_dropout))(x)
         x = Dropout(config.dropout)(x)
         x = Dense(config.num_word_lstm_units, activation='tanh')(x)
+        length_connector = Reshape((-1, 1))(K.cast(length_input, "float32"))
+        x = x + 0.0 * length_connector
 
         base_model = Model(inputs=[word_input, char_input, casing_input, length_input], outputs=[x])
-        self.model = CRFModelWrapperDefault(base_model, ntags)
+        self.model = CRFModelWrapperDefault(base_model, ntags,
+                                            loss_mode=config.crf_loss_type,
+                                            dice_smooth=config.crf_dice_smooth,
+                                            joint_nll_weight=config.crf_joint_nll_weight,
+                                            use_boundary=config.crf_use_boundary)
         self.model.build(input_shape=[(None, None, config.word_embedding_size), (None, None, config.max_char_length), (None, None), (None, None, 1)])
         self.config = config
 
@@ -681,9 +900,14 @@ class BidLSTM_CRF_FEATURES(BaseModel):
                                recurrent_dropout=config.recurrent_dropout))(x)
         x = Dropout(config.dropout)(x)
         x = Dense(config.num_word_lstm_units, activation='tanh')(x)
+        x = TakeFirst(name="length_passthrough")([x, length_input])
 
         base_model = Model(inputs=[word_input, char_input, features_input, length_input], outputs=[x])
-        self.model = CRFModelWrapperDefault(base_model, ntags)
+        self.model = CRFModelWrapperDefault(base_model, ntags,
+                                            loss_mode=config.crf_loss_type,
+                                            dice_smooth=config.crf_dice_smooth,
+                                            joint_nll_weight=config.crf_joint_nll_weight,
+                                            use_boundary=config.crf_use_boundary)
         self.model.build(input_shape=[(None, None, config.word_embedding_size), (None, None, config.max_char_length), (None, None, len(config.features_indices)), (None, None, 1)])
         self.config = config
 
@@ -742,11 +966,16 @@ class BidLSTM_ChainCRF_FEATURES(BaseModel):
                                recurrent_dropout=config.recurrent_dropout))(x)
         x = Dropout(config.dropout)(x)
         x = Dense(config.num_word_lstm_units, activation='tanh')(x)
-        x = Dense(ntags)(x)
-        self.crf = ChainCRF()
-        pred = self.crf(x)
+        # Do not pre-project to ntags; the CRF layer will handle projection internally
+        x = TakeFirst(name="length_passthrough")([x, length_input])
 
-        self.model = Model(inputs=[word_input, char_input, features_input, length_input], outputs=[pred])
+        base_model = Model(inputs=[word_input, char_input, features_input, length_input], outputs=[x])
+        self.model = CRFModelWrapperDefault(base_model, ntags,
+                                            loss_mode=config.crf_loss_type,
+                                            dice_smooth=config.crf_dice_smooth,
+                                            joint_nll_weight=config.crf_joint_nll_weight,
+                                            use_boundary=config.crf_use_boundary)
+        self.model.build(input_shape=[(None, None, config.word_embedding_size), (None, None, config.max_char_length), (None, None, len(config.features_indices)), (None, None, 1)])
         self.config = config
 
 
@@ -873,7 +1102,10 @@ class BERT_CRF(BaseModel):
 
         base_model = Model(inputs=[input_ids_in, token_type_ids, attention_mask], outputs=[x])
 
-        self.model = CRFModelWrapperForBERT(base_model, ntags)
+        self.model = CRFModelWrapperForBERT(base_model, ntags,
+                                            loss_mode=config.crf_loss_type,
+                                            dice_smooth=config.crf_dice_smooth,
+                                            joint_nll_weight=config.crf_joint_nll_weight)
         self.model.build(input_shape=[(None, None, ), (None, None, ), (None, None, )])
         self.config = config
 
@@ -902,12 +1134,14 @@ class BERT_ChainCRF(BaseModel):
 
         #embedding_layer = transformer_layers(input_ids_in, token_type_ids=token_type_ids)[0]
         embedding_layer = transformer_layers(input_ids_in, token_type_ids=token_type_ids, attention_mask=attention_mask)[0]
-        embedding_layer = Dropout(0.1)(embedding_layer)
-        x = Dense(ntags)(embedding_layer)
-        self.crf = ChainCRF()
-        pred = self.crf(x)
+        x = Dropout(0.1)(embedding_layer)
 
-        self.model = Model(inputs=[input_ids_in, token_type_ids, attention_mask], outputs=[pred])
+        base_model = Model(inputs=[input_ids_in, token_type_ids, attention_mask], outputs=[x])
+        self.model = CRFModelWrapperForBERT(base_model, ntags,
+                                            loss_mode=config.crf_loss_type,
+                                            dice_smooth=config.crf_dice_smooth,
+                                            joint_nll_weight=config.crf_joint_nll_weight)
+        self.model.build(input_shape=[(None, None, ), (None, None, ), (None, None, )])
         self.config = config
 
     def get_generator(self):
@@ -964,7 +1198,10 @@ class BERT_CRF_FEATURES(BaseModel):
 
         base_model = Model(inputs=[input_ids_in, features_input, token_type_ids, attention_mask], outputs=[x])
 
-        self.model = CRFModelWrapperForBERT(base_model, ntags)
+        self.model = CRFModelWrapperForBERT(base_model, ntags,
+                                            loss_mode=config.crf_loss_type,
+                                            dice_smooth=config.crf_dice_smooth,
+                                            joint_nll_weight=config.crf_joint_nll_weight)
         self.model.build(input_shape=[(None, None, ), (None, None, len(config.features_indices)), (None, None, ), (None, None, )])
         self.config = config
 
@@ -1022,11 +1259,13 @@ class BERT_ChainCRF_FEATURES(BaseModel):
         x = Dropout(config.dropout)(x)
         x = Dense(config.num_word_lstm_units, activation='tanh')(x)
 
-        x = Dense(ntags)(x)
-        self.crf = ChainCRF()
-        pred = self.crf(x)
-
-        self.model  = Model(inputs=[input_ids_in, features_input, token_type_ids, attention_mask], outputs=[pred])
+        base_model = Model(inputs=[input_ids_in, features_input, token_type_ids, attention_mask], outputs=[x])
+        self.model = CRFModelWrapperForBERT(base_model, ntags,
+                                            loss_mode=config.crf_loss_type,
+                                            dice_smooth=config.crf_dice_smooth,
+                                            joint_nll_weight=config.crf_joint_nll_weight)
+        self.model  = self.model
+        self.model.build(input_shape=[(None, None, ), (None, None, len(config.features_indices)), (None, None, ), (None, None, )])
         self.config = config
 
     def get_generator(self):
@@ -1080,7 +1319,10 @@ class BERT_CRF_CHAR(BaseModel):
         x = Dense(config.num_word_lstm_units, activation='tanh')(x)
 
         base_model = Model(inputs=[input_ids_in, char_input, token_type_ids, attention_mask], outputs=[x])
-        self.model = CRFModelWrapperForBERT(base_model, ntags)
+        self.model = CRFModelWrapperForBERT(base_model, ntags,
+                                            loss_mode=config.crf_loss_type,
+                                            dice_smooth=config.crf_dice_smooth,
+                                            joint_nll_weight=config.crf_joint_nll_weight)
         self.model.build(input_shape=[(None, None, ), (None, None, config.max_char_length), (None, None, ), (None, None, )])
         self.config = config
 
@@ -1152,7 +1394,10 @@ class BERT_CRF_CHAR_FEATURES(BaseModel):
         x = Dense(config.num_word_lstm_units, activation='tanh')(x)
 
         base_model = Model(inputs=[input_ids_in, char_input, features_input, token_type_ids, attention_mask], outputs=[x])
-        self.model = CRFModelWrapperForBERT(base_model, ntags)
+        self.model = CRFModelWrapperForBERT(base_model, ntags,
+                                            loss_mode=config.crf_loss_type,
+                                            dice_smooth=config.crf_dice_smooth,
+                                            joint_nll_weight=config.crf_joint_nll_weight)
         self.model.build(input_shape=[(None, None, ), (None, None, config.max_char_length), (None, None, len(config.features_indices)), (None, None, ), (None, None, )])
         self.config = config
 

@@ -1,8 +1,10 @@
 import os
 
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.callbacks import Callback, EarlyStopping, ModelCheckpoint
+import keras
+from keras.callbacks import Callback, EarlyStopping, ModelCheckpoint
+from keras import ops as K
+from keras import backend as Kb
 from transformers import create_optimizer
 
 from delft.sequenceLabelling.config import ModelConfig
@@ -51,7 +53,7 @@ class Trainer(object):
     def train(self, x_train, y_train, x_valid, y_valid, features_train: np.array = None, features_valid: np.array = None, callbacks=None):
         """
         Train the instance self.model
-        """      
+        """
         self.model = self.compile_model(self.model, len(x_train))
 
         # uncomment to plot graph
@@ -63,6 +65,10 @@ class Trainer(object):
                                   max_epoch=self.training_config.max_epoch, callbacks=callbacks)
 
     def compile_model(self, local_model, train_size):
+
+        # If already compiled (e.g., CRF tagger builds its own compile), skip recompilation
+        if getattr(local_model, 'optimizer', None) is not None:
+            return local_model
 
         nb_train_steps = (train_size // self.training_config.batch_size) * self.training_config.max_epoch
         
@@ -94,36 +100,28 @@ class Trainer(object):
                 )
         else:
             
-            lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+            lr_schedule = keras.optimizers.schedules.ExponentialDecay(
                 initial_learning_rate=self.training_config.learning_rate,
                 decay_steps=nb_train_steps,
                 decay_rate=0.1)
-            optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+            optimizer = keras.optimizers.Adam(learning_rate=lr_schedule)
             
-            #optimizer = tf.keras.optimizers.Adam(self.training_config.learning_rate)
             if local_model.config.use_chain_crf:
                 local_model.compile(
                     optimizer=optimizer,
                     loss=local_model.crf.loss,
                 )
             elif local_model.config.use_crf:
-                if tf.executing_eagerly():
-                    # loss is calculated by the custom CRF wrapper, no need to specify a loss function here
+                # Build a backend-agnostic training graph with in-graph CRF loss
+                try:
+                    training_model = local_model.make_training_model(optimizer=optimizer)
+                    local_model = training_model
+                except Exception as e:
+                    print(f"Warning: falling back to wrapper compute_loss path for CRF (make_training_model failed: {e})")
+                    # Fallback: rely on wrapper compute_loss (may fail under some backends)
                     local_model.compile(
                         optimizer=optimizer,
                     )
-                else:
-                    print("compile model, graph mode")
-                    # always expecting a loss function here, but it is calculated internally by the CRF wapper
-                    # the following will fail in graph mode because 
-                    # '<tf.Variable 'chain_kernel:0' shape=(10, 10) dtype=float32> has `None` for gradient.'
-                    # however this variable cannot be accessed, so no soluton for the moment 
-                    # (probably need not using keras fit and creating a custom training loop to get the gradient)
-                    local_model.compile(
-                        optimizer=optimizer,
-                        loss='sparse_categorical_crossentropy',
-                    )
-                    #local_model.compile(optimizer=optimizer, loss=InnerLossPusher(local_model))
             else:
                 # only sparse label encoding is used (no one-hot encoded labels as it was the case in DeLFT < 0.3)
                 local_model.compile(
@@ -141,57 +139,103 @@ class Trainer(object):
         """
         # todo: if valid set is None, create it as random segment of the shuffled train set
 
-        generator = local_model.get_generator()
-        if self.training_config.early_stop:
-            training_generator = generator(x_train, y_train, 
-                batch_size=self.training_config.batch_size, preprocessor=self.preprocessor, 
-                bert_preprocessor=self.transformer_preprocessor,
-                char_embed_size=self.model_config.char_embedding_size, 
-                max_sequence_length=self.model_config.max_sequence_length,
-                embeddings=self.embeddings, 
-                shuffle=True, features=f_train, use_chain_crf=self.model_config.use_chain_crf)
-
-            validation_generator = generator(x_valid, y_valid,  
-                batch_size=self.training_config.batch_size, preprocessor=self.preprocessor, 
-                bert_preprocessor=self.transformer_preprocessor,
-                char_embed_size=self.model_config.char_embedding_size, 
-                max_sequence_length=self.model_config.max_sequence_length,
-                embeddings=self.embeddings, shuffle=False, features=f_valid, 
-                output_input_offsets=True, use_chain_crf=self.model_config.use_chain_crf)
-
-            _callbacks = get_callbacks(
-                log_dir=self.checkpoint_path,
-                early_stopping=True,
-                patience=self.training_config.patience,
-                valid=(validation_generator, self.preprocessor),
-                use_crf=self.model_config.use_crf,
-                use_chain_crf=self.model_config.use_chain_crf,
-                model=local_model,
-                external_callbacks=callbacks
-            )
+        # Determine generator class; handle plain Keras models (training graph) as well
+        get_gen = getattr(local_model, 'get_generator', None)
+        if callable(get_gen):
+            generator = get_gen()
         else:
-            x_train = np.concatenate((x_train, x_valid), axis=0)
-            y_train = np.concatenate((y_train, y_valid), axis=0)
-            feature_all = None
-            if f_train is not None:
-                feature_all = np.concatenate((f_train, f_valid), axis=0)
+            # Inspect model IO to choose generator robustly
+            try:
+                from delft.sequenceLabelling.data_generator import DataGeneratorCRFTagger, DataGenerator
+                output_names = getattr(local_model, 'output_names', []) or []
+                input_names = [getattr(i, 'name').split(':')[0] for i in getattr(local_model, 'inputs', [])]
+                if ('crf_loss_value' in output_names) or ('crf_log_likelihood_output' in output_names) or getattr(local_model, 'name', '') in ('crf_training_model', 'crf_training_model_loss_only'):
+                    generator = DataGeneratorCRFTagger
+                else:
+                    generator = DataGeneratorCRFTagger if 'labels' in input_names else DataGenerator
+            except Exception:
+                from delft.sequenceLabelling.data_generator import DataGenerator
+                generator = DataGenerator
+            # Determine if model is single-head (loss-only)
+            out_names = getattr(local_model, 'output_names', []) or []
+            loss_only = (len(out_names) == 1 and out_names[0] in ('crf_loss_value','crf_log_likelihood_output'))
 
-            training_generator = generator(x_train, y_train,
-                batch_size=self.training_config.batch_size, preprocessor=self.preprocessor, 
-                bert_preprocessor=self.transformer_preprocessor,
-                char_embed_size=self.model_config.char_embedding_size, 
-                max_sequence_length=self.model_config.max_sequence_length,
-                embeddings=self.embeddings, shuffle=True, 
-                features=feature_all, use_chain_crf=self.model_config.use_chain_crf)
+            # Choose a fixed sequence length by default for CRF models to ensure stable graph shapes
+            gen_max_seq_len = self.model_config.max_sequence_length
+            try:
+                if self.model_config.use_crf and not gen_max_seq_len:
+                    def _max_len(seq_list):
+                        try:
+                            return max((len(s) for s in (seq_list or [])))
+                        except ValueError:
+                            return 0
+                    if self.training_config.early_stop:
+                        gen_max_seq_len = max(_max_len(x_train), _max_len(x_valid) if x_valid is not None else 0)
+                    else:
+                        # In the no-early-stop path we concatenate later; use both now
+                        gen_max_seq_len = max(_max_len(x_train), _max_len(x_valid) if x_valid is not None else 0)
+                    if gen_max_seq_len == 0:
+                        gen_max_seq_len = None
+            except Exception:
+                pass
 
-            _callbacks = get_callbacks(
-                log_dir=self.checkpoint_path,
-                early_stopping=False,
-                use_crf=self.model_config.use_crf,
-                use_chain_crf=self.model_config.use_chain_crf,
-                model=local_model,
-                external_callbacks=callbacks
-            )
+            if self.training_config.early_stop:
+                training_generator = generator(x_train, y_train, 
+                    batch_size=self.training_config.batch_size, preprocessor=self.preprocessor, 
+                    bert_preprocessor=self.transformer_preprocessor,
+                    char_embed_size=self.model_config.char_embedding_size, 
+                    max_sequence_length=gen_max_seq_len,
+                    embeddings=self.embeddings, 
+                    shuffle=True, features=f_train, use_chain_crf=self.model_config.use_chain_crf,
+                    crf_loss_only_outputs=loss_only)
+
+                validation_generator = generator(x_valid, y_valid,  
+                    batch_size=self.training_config.batch_size, preprocessor=self.preprocessor, 
+                    bert_preprocessor=self.transformer_preprocessor,
+                    char_embed_size=self.model_config.char_embedding_size, 
+                    max_sequence_length=gen_max_seq_len,
+                    embeddings=self.embeddings, shuffle=False, features=f_valid, 
+                    output_input_offsets=True, use_chain_crf=self.model_config.use_chain_crf,
+                    crf_loss_only_outputs=loss_only)
+
+                _callbacks = get_callbacks(
+                    log_dir=self.checkpoint_path,
+                    early_stopping=True,
+                    patience=self.training_config.patience,
+                    valid=(validation_generator, self.preprocessor),
+                    use_crf=self.model_config.use_crf,
+                    use_chain_crf=self.model_config.use_chain_crf,
+                    model=local_model,
+                    external_callbacks=callbacks
+                )
+            else:
+                x_train = np.concatenate((x_train, x_valid), axis=0)
+                y_train = np.concatenate((y_train, y_valid), axis=0)
+                feature_all = None
+                if f_train is not None:
+                    feature_all = np.concatenate((f_train, f_valid), axis=0)
+
+                # Determine if model is single-head (loss-only)
+                out_names = getattr(local_model, 'output_names', []) or []
+                loss_only = (len(out_names) == 1 and out_names[0] in ('crf_loss_value','crf_log_likelihood_output'))
+
+                training_generator = generator(x_train, y_train,
+                    batch_size=self.training_config.batch_size, preprocessor=self.preprocessor, 
+                    bert_preprocessor=self.transformer_preprocessor,
+                    char_embed_size=self.model_config.char_embedding_size, 
+                    max_sequence_length=gen_max_seq_len,
+                    embeddings=self.embeddings, shuffle=True, 
+                    features=feature_all, use_chain_crf=self.model_config.use_chain_crf,
+                    crf_loss_only_outputs=loss_only)
+
+                _callbacks = get_callbacks(
+                    log_dir=self.checkpoint_path,
+                    early_stopping=False,
+                    use_crf=self.model_config.use_crf,
+                    use_chain_crf=self.model_config.use_chain_crf,
+                    model=local_model,
+                    external_callbacks=callbacks
+                )
         nb_workers = 6
         multiprocessing = self.training_config.multiprocessing
 
@@ -203,10 +247,8 @@ class Trainer(object):
 
         local_model.fit(
             training_generator,
-                                epochs=max_epoch,
-                                use_multiprocessing=multiprocessing,
-                                workers=nb_workers,
-                                callbacks=_callbacks
+            epochs=max_epoch,
+            callbacks=_callbacks
         )
 
         return local_model
@@ -289,9 +331,9 @@ class Trainer(object):
             if self.model_config.transformer_name is None:
                 self.models.append(foldModel)
             else:
-                # save the model with transformer layer on disk
-                weight_file = DEFAULT_WEIGHT_FILE_NAME.replace(".hdf5", str(fold_id)+".hdf5")
-                foldModel.save(os.path.join(output_directory, weight_file))
+                # save the model with transformer layer on disk (prefer native Keras format)
+                keras_file = f"model{fold_id}.keras"
+                foldModel.save(os.path.join(output_directory, keras_file))
                 if fold_id == 0:
                     foldModel.transformer_config.to_json_file(os.path.join(output_directory, TRANSFORMER_CONFIG_FILE_NAME))
                     if self.model_config.transformer_name is not None:
@@ -303,11 +345,27 @@ class LogLearningRateCallback(Callback):
 
     def __init__(self, model=None):
         super().__init__()
-        self.model = model
+        # Do not assign to self.model (managed by Keras). Keep a reference separately.
+        self.bound_model = model
 
     def on_epoch_end(self, epoch, logs):
-        if self.model is not None:
-            logs.update({"lr": self.model.optimizer._decayed_lr(tf.float32)})
+        # Best-effort LR logging without relying on private TF APIs
+        try:
+            opt = self.bound_model.optimizer if self.bound_model is not None else getattr(self, 'model', None)
+            if opt is None:
+                return
+            lr = getattr(opt, 'learning_rate', None)
+            # Handle schedules or tensors conservatively
+            if hasattr(lr, 'numpy'):
+                lr_val = float(lr.numpy())
+            elif isinstance(lr, (float, int)):
+                lr_val = float(lr)
+            else:
+                # Unable to resolve; skip logging
+                return
+            logs.update({"lr": lr_val})
+        except Exception:
+            return
 
 
 def get_callbacks(log_dir=None, valid=(), early_stopping=True, patience=5, use_crf=True, use_chain_crf=False, model=None, external_callbacks=None):
@@ -351,7 +409,7 @@ def get_callbacks(log_dir=None, valid=(), early_stopping=True, patience=5, use_c
 
 class Scorer(Callback):
 
-    def __init__(self, validation_generator, preprocessor=None, evaluation=False, use_crf=False, use_chain_crf=False):
+    def __init__(self, validation_generator, preprocessor=None, evaluation=False, use_crf=False, use_chain_crf=False, bound_model=None):
         """
         If evaluation is True, we produce a full evaluation with complete report, otherwise it is a
         validation step and will simply produce f1 score
@@ -370,13 +428,17 @@ class Scorer(Callback):
         self.evaluation = evaluation
         self.use_crf = use_crf
         self.use_chain_crf = use_chain_crf
+        # Keep a safe reference to the model for manual evaluation (avoid assigning to Callback.model)
+        self.bound_model = bound_model
 
     def on_epoch_end(self, epoch, logs={}):
         y_pred = None
         y_true = None
-        for i, (data, label) in enumerate(self.valid_batches):
-            if i == self.valid_steps:
-                break
+        # Prefer a safely bound model when provided (e.g., manual eval), otherwise use Keras-assigned self.model
+        local_model = self.bound_model if getattr(self, 'bound_model', None) is not None else getattr(self, 'model', None)
+        # Iterate safely over valid indices to avoid fetching an extra empty batch
+        for i in range(self.valid_steps):
+            data, label = self.valid_batches[i]
             y_true_batch = label       
 
             if isinstance(self.valid_batches, DataGeneratorTransformers):
@@ -388,7 +450,7 @@ class Scorer(Callback):
                 input_offsets = data[-1]
                 data = data[:-1]
 
-                y_pred_batch = self.model.predict_on_batch(data)
+                y_pred_batch = local_model.predict_on_batch(data)
 
                 if not self.use_crf:
                     y_pred_batch = np.argmax(y_pred_batch, -1)
@@ -424,7 +486,15 @@ class Scorer(Callback):
                 y_pred_batch = [self.p.inverse_transform(y) for y in y_pred_batch]
             else:
                 # no transformer layer around, no mess to manage with the sub-tokenization...
-                y_pred_batch = self.model.predict_on_batch(data)
+                y_pred_batch = local_model.predict_on_batch(data)
+
+                # If model has multiple outputs (e.g., decoded + loss vector), keep decoded head
+                if isinstance(y_pred_batch, (list, tuple)):
+                    y_pred_batch = y_pred_batch[0]
+
+                # Targets may be a dict when using the CRF training graph; pick the decoded head
+                if isinstance(y_true_batch, dict):
+                    y_true_batch = y_true_batch.get('decoded_output', next(iter(y_true_batch.values())))
 
                 if not self.use_crf:
                     # one hot encoded predictions
@@ -435,8 +505,11 @@ class Scorer(Callback):
                     y_pred_batch = np.argmax(y_pred_batch, -1)
                     y_true_batch = np.argmax(y_true_batch, -1)
 
-                # we also have the input length available 
-                sequence_lengths = data[-1] # this is the vectors "length_input" of the models input, always last 
+                # sequence lengths
+                if isinstance(data, dict):
+                    sequence_lengths = data.get('length_input')
+                else:
+                    sequence_lengths = data[-1]  # vectors "length_input" always last in tuple
                 # shape of (batch_size, 1), we want (batch_size)
                 sequence_lengths = np.reshape(sequence_lengths, (-1,))
 
@@ -473,8 +546,14 @@ class Scorer(Callback):
 
 
 def sparse_crossentropy_masked(y_true, y_pred):
+    """Backend-agnostic masked sparse categorical crossentropy.
+    Masks out positions where y_true == 0 and averages loss over valid positions.
+    """
     mask_value = 0
-    y_true_masked = tf.boolean_mask(y_true, tf.not_equal(y_true, mask_value))
-    y_pred_masked = tf.boolean_mask(y_pred, tf.not_equal(y_true, mask_value))
-    return tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(y_true_masked, y_pred_masked))
+    # Per-position loss: shape matches y_true without the class axis
+    losses = keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
+    mask = K.cast(K.not_equal(y_true, mask_value), losses.dtype)
+    masked_losses = losses * mask
+    denom = K.sum(mask)
+    return K.sum(masked_losses) / (denom + K.cast(Kb.epsilon(), masked_losses.dtype))
 

@@ -28,7 +28,11 @@ class ModelConfig(object):
                  features_indices=None,
                  features_embedding_size=DEFAULT_FEATURES_EMBEDDING_SIZE,
                  features_lstm_units=DEFAULT_FEATURES_EMBEDDING_SIZE,
-                 transformer_name=None):
+                 transformer_name=None,
+                 crf_loss_type: str = "nll",
+                 crf_dice_smooth: float = 1.0,
+                 crf_joint_nll_weight: float = 0.2,
+                 crf_use_boundary: bool = True):
 
         self.model_name = model_name
         self.architecture = architecture
@@ -63,6 +67,13 @@ class ModelConfig(object):
         self.transformer_name = transformer_name
 
         self.use_ELMo = use_ELMo
+
+        # CRF training options (used when CRF head is present)
+        self.crf_loss_type = crf_loss_type  # 'nll', 'dice', or 'dice+nll'
+        self.crf_dice_smooth = crf_dice_smooth
+        self.crf_joint_nll_weight = crf_joint_nll_weight
+        # CRF boundary handling: default False for right padding; set True for left padding
+        self.crf_use_boundary = crf_use_boundary
 
     def save(self, file):
         with open(file, 'w') as f:

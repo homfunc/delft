@@ -42,6 +42,13 @@ The latest DeLFT release __0.3.4__ has been tested successfully with python 3.8 
 
 ## DeLFT Documentation
 
+Note on CRF training (Keras 3)
+- CRF models now train with a fixed sequence length across all batches by default. If max_sequence_length is set in the config, it is used; otherwise, the trainer computes a fixed length from the dataset. Inputs (tokens, chars, labels, features) are padded/truncated to this fixed length per batch.
+- True per-sample sequence lengths are still passed to the CRF loss/decoder via length_input to ensure padding is ignored correctly.
+- This fixed-length batching stabilizes TensorFlow graph compilation and avoids shape retracing issues.
+
+## DeLFT Documentation
+
 Visit the [DELFT documentation](https://delft.readthedocs.io) for detailed information on installation, usage and models.
 
 ## Using DeLFT 

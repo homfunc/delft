@@ -1,13 +1,14 @@
-from tensorflow.keras import backend as K
-from tensorflow.keras.engine.topology import Layer
-from tensorflow.keras import initializers, regularizers, constraints
+from keras import ops as K
+from keras import layers, initializers, regularizers, constraints
+from keras import backend as Kb
 
 
-class Attention(Layer):
+class Attention(layers.Layer):
     def __init__(self, step_dim,
                  W_regularizer=None, b_regularizer=None,
                  W_constraint=None, b_constraint=None,
                  bias=True, **kwargs):
+        super().__init__(**kwargs)
         self.supports_masking = True
         self.init = initializers.get('glorot_uniform')
 
@@ -20,57 +21,61 @@ class Attention(Layer):
         self.bias = bias
         self.step_dim = step_dim
         self.features_dim = 0
-        super(Attention, self).__init__(**kwargs)
 
     def build(self, input_shape):
         assert len(input_shape) == 3
 
-        self.W = self.add_weight((input_shape[-1],),
+        self.W = self.add_weight(shape=(input_shape[-1],),
                                  initializer=self.init,
-                                 name='{}_W'.format(self.name),
+                                 name=f'{self.name}_W',
                                  regularizer=self.W_regularizer,
                                  constraint=self.W_constraint)
-        self.features_dim = input_shape[-1]
+        self.features_dim = int(input_shape[-1])
 
         if self.bias:
-            self.b = self.add_weight((input_shape[1],),
-                                     initializer='zero',
-                                     name='{}_b'.format(self.name),
+            self.b = self.add_weight(shape=(int(input_shape[1]),),
+                                     initializer='zeros',
+                                     name=f'{self.name}_b',
                                      regularizer=self.b_regularizer,
                                      constraint=self.b_constraint)
         else:
             self.b = None
 
-        self.built = True
+        super().build(input_shape)
 
-    def compute_mask(self, input, input_mask=None):
+    def compute_mask(self, inputs, mask=None):
         return None
 
     def call(self, x, mask=None):
         features_dim = self.features_dim
         step_dim = self.step_dim
 
-        eij = K.reshape(K.dot(K.reshape(x, (-1, features_dim)),
-                        K.reshape(self.W, (features_dim, 1))), (-1, step_dim))
+        eij = K.reshape(
+            K.matmul(
+                K.reshape(x, (-1, features_dim)),
+                K.reshape(self.W, (features_dim, 1))
+            ),
+            (-1, step_dim)
+        )
 
-        if self.bias:
-            eij += self.b
+        if self.bias is not None and self.bias:
+            eij = eij + self.b
 
         eij = K.tanh(eij)
 
         a = K.exp(eij)
 
         if mask is not None:
-            a *= K.cast(mask, K.floatx())
+            a = a * K.cast(mask, a.dtype)
 
-        a /= K.cast(K.sum(a, axis=1, keepdims=True) + K.epsilon(), K.floatx())
+        a = a / (K.sum(a, axis=1, keepdims=True) + K.cast(Kb.epsilon(), a.dtype))
 
-        a = K.expand_dims(a)
+        a = K.expand_dims(a, axis=-1)
         weighted_input = x * a
         return K.sum(weighted_input, axis=1)
 
     def compute_output_shape(self, input_shape):
-        return input_shape[0],  self.features_dim
+        return (input_shape[0], self.features_dim)
 
 
 def dot_product(x, kernel):
@@ -81,4 +86,4 @@ def dot_product(x, kernel):
         kernel (): weights
     Returns:
     """
-    return K.squeeze(K.dot(x, K.expand_dims(kernel)), axis=-1)
+    return K.squeeze(K.matmul(x, K.expand_dims(kernel, axis=-1)), axis=-1)

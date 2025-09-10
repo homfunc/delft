@@ -14,11 +14,14 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning) 
 warnings.filterwarnings("ignore", category=UserWarning) 
 
-import tensorflow as tf
-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
-
-from tensorflow.python.util import deprecation
-deprecation._PRINT_DEPRECATION_WARNINGS = False
+# Optional TensorFlow-only logging control (when TF backend is in use)
+try:
+    import tensorflow as tf  # type: ignore
+    tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
+    from tensorflow.python.util import deprecation  # type: ignore
+    deprecation._PRINT_DEPRECATION_WARNINGS = False
+except Exception:
+    tf = None  # TensorFlow not available; continue without TF-specific logging tweaks
 
 # unfortunately when running in graph mode, we cannot use BERT pre-trained, 
 # see https://github.com/huggingface/transformers/issues/3086
@@ -45,7 +48,10 @@ from sklearn.model_selection import train_test_split
 import transformers
 transformers.logging.set_verbosity(transformers.logging.ERROR) 
 
-from tensorflow.keras.utils import plot_model
+try:
+    from keras.utils import plot_model
+except Exception:
+    plot_model = None
 
 class Classifier(object):
 
