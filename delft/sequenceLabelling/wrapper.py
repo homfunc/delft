@@ -95,7 +95,11 @@ class Sequence(object):
              multiprocessing=True,
              features_indices=None,
              transformer_name: str = None,
-             report_to_wandb = False
+             report_to_wandb = False,
+             crf_loss_type: str | None = None,
+             crf_dice_smooth: float | None = None,
+             crf_joint_nll_weight: float | None = None,
+             crf_use_boundary: bool | None = None,
          ):
 
         if model_name is None:
@@ -133,6 +137,12 @@ class Sequence(object):
             else:
                 learning_rate = 2e-5
 
+        # Resolve CRF options (use ModelConfig defaults if not provided)
+        _crf_loss_type = crf_loss_type if crf_loss_type is not None else 'nll'
+        _crf_dice_smooth = crf_dice_smooth if crf_dice_smooth is not None else 1.0
+        _crf_joint_nll_weight = crf_joint_nll_weight if crf_joint_nll_weight is not None else 0.2
+        _crf_use_boundary = crf_use_boundary if crf_use_boundary is not None else True
+
         self.model_config = ModelConfig(model_name=model_name,
                                         architecture=architecture,
                                         embeddings_name=embeddings_name,
@@ -148,7 +158,11 @@ class Sequence(object):
                                         batch_size=batch_size,
                                         use_ELMo=use_ELMo,
                                         features_indices=features_indices,
-                                        transformer_name=transformer_name)
+                                        transformer_name=transformer_name,
+                                        crf_loss_type=_crf_loss_type,
+                                        crf_dice_smooth=_crf_dice_smooth,
+                                        crf_joint_nll_weight=_crf_joint_nll_weight,
+                                        crf_use_boundary=_crf_use_boundary)
 
         self.training_config = TrainingConfig(learning_rate, batch_size, optimizer,
                                               lr_decay, clip_gradients, max_epoch,
@@ -258,12 +272,27 @@ class Sequence(object):
         #plot_model(self.model, 
         #    to_file='data/models/textClassification/'+self.model_config.model_name+'_'+self.model_config.architecture+'.png')
 
+        # Force single-worker generator for memory stability when embeddings are used
+        _train_cfg = self.training_config
+        _train_cfg = type(_train_cfg)(
+            learning_rate=_train_cfg.learning_rate,
+            batch_size=_train_cfg.batch_size,
+            optimizer=_train_cfg.optimizer,
+            lr_decay=_train_cfg.lr_decay,
+            clip_gradients=_train_cfg.clip_gradients,
+            max_epoch=_train_cfg.max_epoch,
+            early_stop=_train_cfg.early_stop,
+            patience=_train_cfg.patience,
+            max_checkpoints_to_keep=_train_cfg.max_checkpoints_to_keep,
+            multiprocessing=False,
+        )
+
         trainer = Trainer(
             self.model,
             self.models,
             self.embeddings,
             self.model_config,
-            self.training_config,
+            _train_cfg,
             checkpoint_path=self.log_dir,
             preprocessor=self.p,
             transformer_preprocessor=self.model.transformer_preprocessor,

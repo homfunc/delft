@@ -14,11 +14,13 @@ import zipfile
 import json
 import lmdb
 import numpy as np
-import tensorflow as tf
+try:
+    import tensorflow as tf  # Only required for ELMo; may be absent in non-TF backends
+except Exception:
+    tf = None
 from tqdm import tqdm
 from pathlib import Path
 
-from delft.utilities.simple_elmo import ElmoModel, elmo
 
 logging.basicConfig()
 logging.getLogger().setLevel(logging.ERROR)
@@ -84,12 +86,23 @@ class Embeddings(object):
         if elmo_model_name == None:
             self.elmo_model_name = 'elmo-'+self.lang
         if use_ELMo:
-            #tf.compat.v1.disable_eager_execution()
+            # Require TensorFlow to be available and selected as the Keras backend
+            if tf is None:
+                raise RuntimeError("ELMo embeddings require TensorFlow; please install TF or disable use_ELMo.")
+            backend_name = None
+            try:
+                from keras import config as _kcfg
+                backend_name = _kcfg.backend()
+            except Exception:
+                backend_name = os.environ.get("KERAS_BACKEND", None)
+            if str(backend_name).lower() != 'tensorflow':
+                raise RuntimeError("ELMo embeddings are only supported with the TensorFlow backend. Set KERAS_BACKEND=tensorflow.")
+            # Initialize ELMo
             self.make_ELMo()
             self.embed_size = ELMo_embed_size + self.embed_size
             description = self.get_description(self.elmo_model_name)
             self.env_ELMo = None
-            if description and description["cache-training"] and self.use_cache:
+            if description and description.get("cache-training") and self.use_cache:
                 self.embedding_ELMo_cache = os.path.join(description["path-cache"], "cache")
                 # clean possible remaining cache
                 self.clean_ELMo_cache()
@@ -98,6 +111,23 @@ class Embeddings(object):
 
     def __getattr__(self, name):
         return getattr(self.model, name)
+
+    def make_ELMo(self):
+        # Lazy import to avoid loading TensorFlow-dependent code under non-TF backends
+        from delft.utilities.simple_elmo import ElmoModel, elmo
+        description = self.get_description(self.elmo_model_name)
+        if description is None:
+            raise RuntimeError(f"No ELMo description found in registry for {self.elmo_model_name}")
+        model_path = description.get("path")
+        options_path = description.get("options")
+        weight_path = description.get("weights")
+        if not (model_path or (options_path and weight_path)):
+            raise RuntimeError("Invalid ELMo configuration: missing model or (options, weights)")
+        # Create ElmoModel according to available description
+        if model_path:
+            self.elmo_model = ElmoModel(model_path)
+        else:
+            self.elmo_model = ElmoModel((options_path, weight_path))
 
     def make_embeddings_simple_in_memory(self, name="fasttext-crawl"):
         nbWords = 0
@@ -337,6 +367,8 @@ class Embeddings(object):
             # initialize session for reuse
             with elmo_graph.as_default() as current_graph:
                 self.tf_session_elmo = tf.compat.v1.Session(graph=elmo_graph)
+                if tf is None:
+                    raise RuntimeError("ELMo embeddings require TensorFlow; please install TF or disable use_ELMo.")
                 with self.tf_session_elmo.as_default() as sess:
                     self.elmo_model.elmo_sentence_input = elmo.weight_layers("input", self.elmo_model.sentence_embeddings_op)
                     sess.run(tf.compat.v1.global_variables_initializer())
@@ -557,6 +589,8 @@ class Embeddings(object):
         if not self.use_ELMo:
             print("Warning: ELMo embeddings requested but embeddings object wrongly initialised")
             return
+        if tf is None:
+            raise RuntimeError("ELMo embeddings require TensorFlow; please install TF or disable use_ELMo.")
 
         # Create batches of data
         local_token_ids = self.elmo_model.batcher.batch_sentences(token_list)
@@ -581,6 +615,8 @@ class Embeddings(object):
         if not self.use_ELMo:
             print("Warning: ELMo embeddings requested but embeddings object wrongly initialised")
             return
+        if tf is None:
+            raise RuntimeError("ELMo embeddings require TensorFlow; please install TF or disable use_ELMo.")
 
         local_token_ids = self.elmo_model.batcher.batch_sentences(token_list)
         max_size_sentence = local_token_ids[0].shape[0]

@@ -263,9 +263,8 @@ class DataGeneratorCRFTagger(DataGenerator):
     Generator variant for CRF tagger models that expect inputs {'tokens', 'labels', ...}
     and outputs {'decoded_output', 'crf_loss_value'}.
     """
-    def __init__(self, *args, crf_loss_only_outputs: bool = False, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.crf_loss_only_outputs = crf_loss_only_outputs
     def __getitem__(self, index):
         batch_x, batch_c, batch_f, batch_a, batch_l, batch_y = self._DataGenerator__data_generation(index)
         # Build tokens mask (1 for valid positions, 0 for pad) from lengths

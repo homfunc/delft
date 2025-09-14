@@ -26,6 +26,8 @@ class CRFModelWrapperDefault(Model):
         self.joint_nll_weight = float(joint_nll_weight)
         self.use_kernel = bool(use_kernel)
         self.use_boundary = bool(use_boundary)
+        # cache for last CRF internals to support compute_loss without recompute
+        self._last_crf_tensors = None
         # Instantiate the standard CRF layer from keras3-crf with default internal naming
         # Right-padding compatibility: disable boundaries by default (can be overridden with use_boundary=True)
         self.crf = KCRF(self.num_tags if self.num_tags is not None else 1, name="crf", use_kernel=self.use_kernel, use_boundary=self.use_boundary)
@@ -46,6 +48,11 @@ class CRFModelWrapperDefault(Model):
             decoded, potentials, lengths, trans = self.crf(feats, lengths=seq_lengths)
         else:
             decoded, potentials, lengths, trans = self.crf(feats)
+        # cache tensors for compute_loss
+        try:
+            self._last_crf_tensors = (potentials, lengths, trans)
+        except Exception:
+            self._last_crf_tensors = None
         if return_crf_internal:
             return (potentials, lengths, trans), decoded
         return decoded
@@ -69,6 +76,7 @@ class CRFModelWrapperDefault(Model):
 
         # Token mask from tokens (1 for valid, 0 for pad)
         token_mask = keras.layers.Lambda(lambda t: _K.not_equal(t, 0), name="token_mask")(tokens_in)
+        # Per-sample valid lengths from mask
         lengths_flat = keras.layers.Lambda(lambda m: _K.sum(_K.cast(m, "int32"), axis=1), name="lengths_flat")(token_mask)
 
         # CRF forward
@@ -207,15 +215,6 @@ class CRFModelWrapperDefault(Model):
         obj = cls(base_model=base_model, num_tags=num_tags, loss_mode=loss_mode,
                    dice_smooth=dice_smooth, joint_nll_weight=joint_nll_weight,
                    use_kernel=use_kernel, use_boundary=use_boundary, **config)
-        # # If a CRF layer config is present, deserialize and assign explicitly
-        # try:
-        #     if crf_cfg is not None:
-        #         crf_layer = deserialize_keras_object(crf_cfg)
-        #         # Preserve name 'crf' to match weight paths
-        #         crf_layer._name = getattr(crf_layer, '_name', 'crf')
-        #         obj.crf = crf_layer
-        # except Exception:
-        #     pass
         return obj
 
     # Help Keras 3 build variables without running eager data through call()

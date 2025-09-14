@@ -118,7 +118,7 @@ class Trainer(object):
                     local_model = training_model
                 except Exception as e:
                     print(f"Warning: falling back to wrapper compute_loss path for CRF (make_training_model failed: {e})")
-                    # Fallback: rely on wrapper compute_loss (may fail under some backends)
+                    # Fallback: rely on wrapper compute_loss
                     local_model.compile(
                         optimizer=optimizer,
                     )
@@ -156,89 +156,86 @@ class Trainer(object):
             except Exception:
                 from delft.sequenceLabelling.data_generator import DataGenerator
                 generator = DataGenerator
-            # Determine if model is single-head (loss-only)
-            out_names = getattr(local_model, 'output_names', []) or []
-            loss_only = (len(out_names) == 1 and out_names[0] in ('crf_loss_value','crf_log_likelihood_output'))
 
-            # Choose a fixed sequence length by default for CRF models to ensure stable graph shapes
-            gen_max_seq_len = self.model_config.max_sequence_length
-            try:
-                if self.model_config.use_crf and not gen_max_seq_len:
-                    def _max_len(seq_list):
-                        try:
-                            return max((len(s) for s in (seq_list or [])))
-                        except ValueError:
-                            return 0
-                    if self.training_config.early_stop:
-                        gen_max_seq_len = max(_max_len(x_train), _max_len(x_valid) if x_valid is not None else 0)
-                    else:
-                        # In the no-early-stop path we concatenate later; use both now
-                        gen_max_seq_len = max(_max_len(x_train), _max_len(x_valid) if x_valid is not None else 0)
-                    if gen_max_seq_len == 0:
-                        gen_max_seq_len = None
-            except Exception:
-                pass
+        # Choose a fixed sequence length by default for CRF models to ensure stable graph shapes
+        gen_max_seq_len = self.model_config.max_sequence_length
+        try:
+            if self.model_config.use_crf and not gen_max_seq_len:
+                def _max_len(seq_list):
+                    try:
+                        return max((len(s) for s in (seq_list or [])))
+                    except ValueError:
+                        return 0
+                if self.training_config.early_stop:
+                    gen_max_seq_len = max(_max_len(x_train), _max_len(x_valid) if x_valid is not None else 0)
+                else:
+                    # In the no-early-stop path we concatenate later; use both now
+                    gen_max_seq_len = max(_max_len(x_train), _max_len(x_valid) if x_valid is not None else 0)
+                if gen_max_seq_len == 0:
+                    gen_max_seq_len = None
+        except Exception:
+            pass
 
-            if self.training_config.early_stop:
-                training_generator = generator(x_train, y_train, 
-                    batch_size=self.training_config.batch_size, preprocessor=self.preprocessor, 
-                    bert_preprocessor=self.transformer_preprocessor,
-                    char_embed_size=self.model_config.char_embedding_size, 
-                    max_sequence_length=gen_max_seq_len,
-                    embeddings=self.embeddings, 
-                    shuffle=True, features=f_train, use_chain_crf=self.model_config.use_chain_crf,
-                    pad_to_max_sequence_length=True,
-                    crf_loss_only_outputs=loss_only)
+        if self.training_config.early_stop:
+            gen_kwargs = dict(
+                batch_size=self.training_config.batch_size,
+                preprocessor=self.preprocessor,
+                bert_preprocessor=self.transformer_preprocessor,
+                char_embed_size=self.model_config.char_embedding_size,
+                max_sequence_length=gen_max_seq_len,
+                embeddings=self.embeddings,
+                use_chain_crf=self.model_config.use_chain_crf,
+                pad_to_max_sequence_length=True,
+            )
+            # Training generator
+            train_kwargs = dict(gen_kwargs)
+            train_kwargs.update(dict(shuffle=True, features=f_train))
+            training_generator = generator(x_train, y_train, **train_kwargs)
 
-                validation_generator = generator(x_valid, y_valid,  
-                    batch_size=self.training_config.batch_size, preprocessor=self.preprocessor, 
-                    bert_preprocessor=self.transformer_preprocessor,
-                    char_embed_size=self.model_config.char_embedding_size, 
-                    max_sequence_length=gen_max_seq_len,
-                    embeddings=self.embeddings, shuffle=False, features=f_valid, 
-                    output_input_offsets=True, use_chain_crf=self.model_config.use_chain_crf,
-                    pad_to_max_sequence_length=True,
-                    crf_loss_only_outputs=loss_only)
+            # Validation generator
+            val_kwargs = dict(gen_kwargs)
+            val_kwargs.update(dict(shuffle=False, features=f_valid, output_input_offsets=True))
+            validation_generator = generator(x_valid, y_valid, **val_kwargs)
 
-                _callbacks = get_callbacks(
-                    log_dir=self.checkpoint_path,
-                    early_stopping=True,
-                    patience=self.training_config.patience,
-                    valid=(validation_generator, self.preprocessor),
-                    use_crf=self.model_config.use_crf,
-                    use_chain_crf=self.model_config.use_chain_crf,
-                    model=local_model,
-                    external_callbacks=callbacks
-                )
-            else:
-                x_train = np.concatenate((x_train, x_valid), axis=0)
-                y_train = np.concatenate((y_train, y_valid), axis=0)
-                feature_all = None
-                if f_train is not None:
-                    feature_all = np.concatenate((f_train, f_valid), axis=0)
+            _callbacks = get_callbacks(
+                log_dir=self.checkpoint_path,
+                early_stopping=True,
+                patience=self.training_config.patience,
+                valid=(validation_generator, self.preprocessor),
+                use_crf=self.model_config.use_crf,
+                use_chain_crf=self.model_config.use_chain_crf,
+                model=local_model,
+                external_callbacks=callbacks
+            )
+        else:
+            x_train = np.concatenate((x_train, x_valid), axis=0)
+            y_train = np.concatenate((y_train, y_valid), axis=0)
+            feature_all = None
+            if f_train is not None:
+                feature_all = np.concatenate((f_train, f_valid), axis=0)
 
-                # Determine if model is single-head (loss-only)
-                out_names = getattr(local_model, 'output_names', []) or []
-                loss_only = (len(out_names) == 1 and out_names[0] in ('crf_loss_value','crf_log_likelihood_output'))
+            gen_kwargs = dict(
+                batch_size=self.training_config.batch_size,
+                preprocessor=self.preprocessor,
+                bert_preprocessor=self.transformer_preprocessor,
+                char_embed_size=self.model_config.char_embedding_size,
+                max_sequence_length=gen_max_seq_len,
+                embeddings=self.embeddings,
+                shuffle=True,
+                features=feature_all,
+                use_chain_crf=self.model_config.use_chain_crf,
+                pad_to_max_sequence_length=True,
+            )
+            training_generator = generator(x_train, y_train, **gen_kwargs)
 
-                training_generator = generator(x_train, y_train,
-                    batch_size=self.training_config.batch_size, preprocessor=self.preprocessor, 
-                    bert_preprocessor=self.transformer_preprocessor,
-                    char_embed_size=self.model_config.char_embedding_size, 
-                    max_sequence_length=gen_max_seq_len,
-                    embeddings=self.embeddings, shuffle=True, 
-                    features=feature_all, use_chain_crf=self.model_config.use_chain_crf,
-                    pad_to_max_sequence_length=True,
-                    crf_loss_only_outputs=loss_only)
-
-                _callbacks = get_callbacks(
-                    log_dir=self.checkpoint_path,
-                    early_stopping=False,
-                    use_crf=self.model_config.use_crf,
-                    use_chain_crf=self.model_config.use_chain_crf,
-                    model=local_model,
-                    external_callbacks=callbacks
-                )
+            _callbacks = get_callbacks(
+                log_dir=self.checkpoint_path,
+                early_stopping=False,
+                use_crf=self.model_config.use_crf,
+                use_chain_crf=self.model_config.use_chain_crf,
+                model=local_model,
+                external_callbacks=callbacks
+            )
         nb_workers = 6
         multiprocessing = self.training_config.multiprocessing
 

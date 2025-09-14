@@ -216,7 +216,11 @@ def train(model, embeddings_name=None, architecture=None, transformer=None, inpu
         early_stop=early_stop,
         patience=patience,
         learning_rate=learning_rate,
-        report_to_wandb=report_to_wandb
+        report_to_wandb=report_to_wandb,
+        crf_loss_type=args.crf_loss,
+        crf_dice_smooth=args.crf_dice_smooth,
+        crf_joint_nll_weight=args.crf_joint_nll_weight,
+        crf_use_boundary=args.crf_use_boundary,
     )
 
     if incremental:
@@ -276,11 +280,28 @@ def train_eval(model, embeddings_name=None, architecture='BidLSTM_CRF', transfor
                                                                             patience,
                                                                             early_stop)
 
-    model = Sequence(model_name, architecture=architecture, embeddings_name=embeddings_name,
-                     max_sequence_length=max_sequence_length, recurrent_dropout=0.50, batch_size=batch_size,
-                     learning_rate=learning_rate, max_epoch=max_epoch, early_stop=early_stop, patience=patience,
-                     use_ELMo=use_ELMo, fold_number=fold_count, multiprocessing=multiprocessing,
-                     features_indices=features_indices, transformer_name=transformer, report_to_wandb=report_to_wandb)
+    model = Sequence(
+        model_name,
+        architecture=architecture,
+        embeddings_name=embeddings_name,
+        max_sequence_length=max_sequence_length,
+        recurrent_dropout=0.50,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        max_epoch=max_epoch,
+        early_stop=early_stop,
+        patience=patience,
+        use_ELMo=use_ELMo,
+        fold_number=fold_count,
+        multiprocessing=multiprocessing,
+        features_indices=features_indices,
+        transformer_name=transformer,
+        report_to_wandb=report_to_wandb,
+        crf_loss_type=args.crf_loss,
+        crf_dice_smooth=args.crf_dice_smooth,
+        crf_joint_nll_weight=args.crf_joint_nll_weight,
+        crf_use_boundary=args.crf_use_boundary,
+    )
 
     if incremental:
         if input_model_path != None:
@@ -441,6 +462,32 @@ if __name__ == "__main__":
                         help="Force early training termination when metrics scores are not improving " + 
                              "after a number of epochs equals to the patience parameter.")
 
+    # CRF options
+    parser.add_argument(
+        "--crf-loss",
+        default=None,
+        choices=["nll", "dice", "dice+nll", "joint"],
+        help="CRF loss to use when training: nll (negative log-likelihood), dice, or dice+nll (alias: joint)."
+    )
+    parser.add_argument(
+        "--crf-dice-smooth",
+        type=float,
+        default=None,
+        help="Smoothing constant for CRF dice loss. Ignored unless --crf-loss=dice or dice+nll."
+    )
+    parser.add_argument(
+        "--crf-joint-nll-weight",
+        type=float,
+        default=None,
+        help="Weight alpha for the NLL term in joint dice+nll loss. Ignored unless --crf-loss=dice+nll."
+    )
+    parser.add_argument(
+        "--crf-use-boundary",
+        type=t_or_f,
+        default=None,
+        help="Whether to enable CRF boundary parameters (left/right). Useful for left-padding masks."
+    )
+
     parser.add_argument("--multi-gpu", default=False,
                         help="Enable the support for distributed computing (the batch size needs to be set accordingly using --batch-size)",
                         action="store_true")
@@ -472,6 +519,10 @@ if __name__ == "__main__":
     early_stop = args.early_stop
     multi_gpu = args.multi_gpu
     wandb = args.wandb
+
+    # Normalize CRF loss alias
+    if args.crf_loss == 'joint':
+        args.crf_loss = 'dice+nll'
 
     if architecture is None:
         raise ValueError("A model architecture has to be specified: " + str(architectures))

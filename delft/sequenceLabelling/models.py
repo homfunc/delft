@@ -342,40 +342,57 @@ class BidLSTM(BaseModel):
                                     name='char_embeddings'
                                     ))(char_input)
 
-        # Compute per-token char lengths from char_input and build explicit per-token char representation
-        char_lengths = ComputeCharLengths(name='char_lengths')(char_input)
-        # Forward and backward char LSTMs with full sequences
-        f_seq = TimeDistributed(LSTM(
-            config.num_char_lstm_units,
-            return_sequences=True,
-            activation='tanh',
-            recurrent_activation='sigmoid',
-            use_bias=True,
-            unit_forget_bias=True,
-            kernel_initializer='glorot_uniform',
-            recurrent_initializer='orthogonal',
-            bias_initializer='zeros',
-            implementation=1,
-            recurrent_dropout=0.0,
-        ), name='char_lstm_fwd')(char_embeddings)
-        b_seq = TimeDistributed(LSTM(
-            config.num_char_lstm_units,
-            return_sequences=True,
-            go_backwards=True,
-            activation='tanh',
-            recurrent_activation='sigmoid',
-            use_bias=True,
-            unit_forget_bias=True,
-            kernel_initializer='glorot_uniform',
-            recurrent_initializer='orthogonal',
-            bias_initializer='zeros',
-            implementation=1,
-            recurrent_dropout=0.0,
-        ), name='char_lstm_bwd')(char_embeddings)
-        # Gather last valid forward step and first backward step
-        f_last = GatherAtIndex(name='char_f_last')([f_seq, K.maximum(char_lengths - 1, 0)])
-        b_first = GatherAtIndex(name='char_b_first')([b_seq, K.zeros_like(char_lengths)])
-        chars = keras.layers.Concatenate(name='char_repr')([f_last, b_first])
+        # Choose classic or deterministic char path (default: classic)
+        import os as _os
+        if _os.environ.get('DELFT_DETERMINISTIC_CHAR') == '1':
+            # Deterministic, backend-stable path
+            char_lengths = ComputeCharLengths(name='char_lengths')(char_input)
+            f_seq = TimeDistributed(LSTM(
+                config.num_char_lstm_units,
+                return_sequences=True,
+                activation='tanh',
+                recurrent_activation='sigmoid',
+                use_bias=True,
+                unit_forget_bias=True,
+                kernel_initializer='glorot_uniform',
+                recurrent_initializer='orthogonal',
+                bias_initializer='zeros',
+                implementation=1,
+                recurrent_dropout=0.0,
+            ), name='char_lstm_fwd')(char_embeddings)
+            b_seq = TimeDistributed(LSTM(
+                config.num_char_lstm_units,
+                return_sequences=True,
+                go_backwards=True,
+                activation='tanh',
+                recurrent_activation='sigmoid',
+                use_bias=True,
+                unit_forget_bias=True,
+                kernel_initializer='glorot_uniform',
+                recurrent_initializer='orthogonal',
+                bias_initializer='zeros',
+                implementation=1,
+                recurrent_dropout=0.0,
+            ), name='char_lstm_bwd')(char_embeddings)
+            f_last = GatherAtIndex(name='char_f_last')([f_seq, K.maximum(char_lengths - 1, 0)])
+            b_first = GatherAtIndex(name='char_b_first')([b_seq, K.zeros_like(char_lengths)])
+            chars = keras.layers.Concatenate(name='char_repr')([f_last, b_first])
+        else:
+            # Classic masked last-step via TimeDistributed BiLSTM
+            chars = TimeDistributed(
+                Bidirectional(LSTM(config.num_char_lstm_units,
+                                   return_sequences=False,
+                                   activation='tanh',
+                                   recurrent_activation='sigmoid',
+                                   use_bias=True,
+                                   unit_forget_bias=True,
+                                   kernel_initializer='glorot_uniform',
+                                   recurrent_initializer='orthogonal',
+                                   bias_initializer='zeros',
+                                   implementation=1,
+                                   recurrent_dropout=0.0),
+                               name='char_bilstm')
+            )(char_embeddings)
 
         # length of sequence not used by the model, but used by the training scorer
         length_input = Input(batch_shape=(None, 1), dtype='int32', name='length_input')
@@ -424,29 +441,11 @@ class BidLSTM_CRF(BaseModel):
                                     name='char_embeddings'
                                     ))(char_input)
 
-        # Two modes for parity vs. deterministic char representation
+        # Classic by default; deterministic path opt-in via env
         import os as _os
-        if _os.environ.get('DELFT_PARITY_LEGACY_CHAR') == '1':
-            # Legacy semantics to match original tf.keras behavior under masking
-            chars = TimeDistributed(
-                Bidirectional(LSTM(config.num_char_lstm_units,
-                                   return_sequences=False,
-                                   activation='tanh',
-                                   recurrent_activation='sigmoid',
-                                   use_bias=True,
-                                   unit_forget_bias=True,
-                                   kernel_initializer='glorot_uniform',
-                                   recurrent_initializer='orthogonal',
-                                   bias_initializer='zeros',
-                                   implementation=1,
-                                   recurrent_dropout=0.0),
-                               name='char_bilstm'),
-                name='time_distributed_1')(char_embeddings)
-        else:
+        if _os.environ.get('DELFT_DETERMINISTIC_CHAR') == '1':
             # Deterministic, backend-stable path
-            # Compute per-token char lengths from char_input and build explicit per-token char representation
             char_lengths = ComputeCharLengths(name='char_lengths')(char_input)
-            # Forward and backward char LSTMs with full sequences
             f_seq = TimeDistributed(LSTM(
                 config.num_char_lstm_units,
                 return_sequences=True,
@@ -474,10 +473,25 @@ class BidLSTM_CRF(BaseModel):
                 implementation=1,
                 recurrent_dropout=0.0,
             ), name='char_lstm_bwd')(char_embeddings)
-            # Gather last valid forward step and first backward step
             f_last = GatherAtIndex(name='char_f_last')([f_seq, K.maximum(char_lengths - 1, 0)])
             b_first = GatherAtIndex(name='char_b_first')([b_seq, K.zeros_like(char_lengths)])
             chars = keras.layers.Concatenate(name='char_repr')([f_last, b_first])
+        else:
+            # Classic masked last-step via TimeDistributed BiLSTM
+            chars = TimeDistributed(
+                Bidirectional(LSTM(config.num_char_lstm_units,
+                                   return_sequences=False,
+                                   activation='tanh',
+                                   recurrent_activation='sigmoid',
+                                   use_bias=True,
+                                   unit_forget_bias=True,
+                                   kernel_initializer='glorot_uniform',
+                                   recurrent_initializer='orthogonal',
+                                   bias_initializer='zeros',
+                                   implementation=1,
+                                   recurrent_dropout=0.0),
+                               name='char_bilstm'),
+                name='time_distributed_1')(char_embeddings)
 
         # length of sequence not used by the model, but used by the training scorer
         length_input = Input(batch_shape=(None, 1), dtype='int32', name='length_input')
@@ -495,7 +509,6 @@ class BidLSTM_CRF(BaseModel):
         x = ApplyLengthMask(name="length_mask")([x, length_input])
 
         base_model = Model(inputs=[word_input, char_input, length_input], outputs=[x])
-        # crf_model = KCRF(ntags, name="crf", use_kernel=True)
 
         self.model = CRFModelWrapperDefault(base_model, ntags,
                                             loss_mode=config.crf_loss_type,
@@ -539,40 +552,54 @@ class BidLSTM_ChainCRF(BaseModel):
                                     name='char_embeddings'
                                     ))(char_input)
 
-        # Compute per-token char lengths from char_input and build explicit per-token char representation
-        char_lengths = ComputeCharLengths(name='char_lengths')(char_input)
-        # Forward and backward char LSTMs with full sequences
-        f_seq = TimeDistributed(LSTM(
-            config.num_char_lstm_units,
-            return_sequences=True,
-            activation='tanh',
-            recurrent_activation='sigmoid',
-            use_bias=True,
-            unit_forget_bias=True,
-            kernel_initializer='glorot_uniform',
-            recurrent_initializer='orthogonal',
-            bias_initializer='zeros',
-            implementation=1,
-            recurrent_dropout=0.0,
-        ), name='char_lstm_fwd')(char_embeddings)
-        b_seq = TimeDistributed(LSTM(
-            config.num_char_lstm_units,
-            return_sequences=True,
-            go_backwards=True,
-            activation='tanh',
-            recurrent_activation='sigmoid',
-            use_bias=True,
-            unit_forget_bias=True,
-            kernel_initializer='glorot_uniform',
-            recurrent_initializer='orthogonal',
-            bias_initializer='zeros',
-            implementation=1,
-            recurrent_dropout=0.0,
-        ), name='char_lstm_bwd')(char_embeddings)
-        # Gather last valid forward step and first backward step
-        f_last = GatherAtIndex(name='char_f_last')([f_seq, K.maximum(char_lengths - 1, 0)])
-        b_first = GatherAtIndex(name='char_b_first')([b_seq, K.zeros_like(char_lengths)])
-        chars = keras.layers.Concatenate(name='char_repr')([f_last, b_first])
+        # Choose classic or deterministic char path (default: classic)
+        import os as _os
+        if _os.environ.get('DELFT_DETERMINISTIC_CHAR') == '1':
+            char_lengths = ComputeCharLengths(name='char_lengths')(char_input)
+            f_seq = TimeDistributed(LSTM(
+                config.num_char_lstm_units,
+                return_sequences=True,
+                activation='tanh',
+                recurrent_activation='sigmoid',
+                use_bias=True,
+                unit_forget_bias=True,
+                kernel_initializer='glorot_uniform',
+                recurrent_initializer='orthogonal',
+                bias_initializer='zeros',
+                implementation=1,
+                recurrent_dropout=0.0,
+            ), name='char_lstm_fwd')(char_embeddings)
+            b_seq = TimeDistributed(LSTM(
+                config.num_char_lstm_units,
+                return_sequences=True,
+                go_backwards=True,
+                activation='tanh',
+                recurrent_activation='sigmoid',
+                use_bias=True,
+                unit_forget_bias=True,
+                kernel_initializer='glorot_uniform',
+                recurrent_initializer='orthogonal',
+                bias_initializer='zeros',
+                implementation=1,
+                recurrent_dropout=0.0,
+            ), name='char_lstm_bwd')(char_embeddings)
+            f_last = GatherAtIndex(name='char_f_last')([f_seq, K.maximum(char_lengths - 1, 0)])
+            b_first = GatherAtIndex(name='char_b_first')([b_seq, K.zeros_like(char_lengths)])
+            chars = keras.layers.Concatenate(name='char_repr')([f_last, b_first])
+        else:
+            chars = TimeDistributed(
+                Bidirectional(LSTM(config.num_char_lstm_units,
+                                   return_sequences=False,
+                                   activation='tanh',
+                                   recurrent_activation='sigmoid',
+                                   use_bias=True,
+                                   unit_forget_bias=True,
+                                   kernel_initializer='glorot_uniform',
+                                   recurrent_initializer='orthogonal',
+                                   bias_initializer='zeros',
+                                   implementation=1,
+                                   recurrent_dropout=0.0)
+                ))(char_embeddings)
 
         # length of sequence not used by the model, but used by the training scorer
         length_input = Input(batch_shape=(None, 1), dtype='int32', name='length_input')

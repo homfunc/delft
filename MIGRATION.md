@@ -29,3 +29,11 @@ Action items for downstream projects
   - Right padding => `crf_use_boundary=False` (default)
   - Left padding => `crf_use_boundary=True`
 
+CRF loss options (new)
+- Sequence labeling CLIs now expose CRF training options:
+  - `--crf-loss {nll,dice,dice+nll|joint}`
+  - `--crf-dice-smooth FLOAT`
+  - `--crf-joint-nll-weight FLOAT`
+  - `--crf-use-boundary true|false`
+- These flow into ModelConfig and configure the CRF wrapper (keras3-crf), backend-agnostically.
+

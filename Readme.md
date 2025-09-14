@@ -47,6 +47,26 @@ Note on CRF training (Keras 3)
 - True per-sample sequence lengths are still passed to the CRF loss/decoder via length_input to ensure padding is ignored correctly.
 - This fixed-length batching stabilizes TensorFlow graph compilation and avoids shape retracing issues.
 
+CRF loss selection (Keras 3, backend-agnostic)
+- Sequence labeling CLIs now expose CRF training options:
+  - --crf-loss {nll,dice,dice+nll|joint}
+  - --crf-dice-smooth FLOAT
+  - --crf-joint-nll-weight FLOAT
+  - --crf-use-boundary true|false
+
+Examples
+- Joint dice+NLL with JAX backend:
+  mamba run -n kaggle env PYTHONPATH=/home/m_thing/development/delft KERAS_BACKEND=jax \
+    python -m delft.applications.grobidTagger date train --architecture BidLSTM_CRF \
+    --embedding glove-840B --max-epoch 3 --early-stop False --batch-size 8 \
+    --crf-loss dice+nll --crf-dice-smooth 1.0 --crf-joint-nll-weight 0.3
+
+- NLL-only:
+  mamba run -n kaggle env PYTHONPATH=/home/m_thing/development/delft KERAS_BACKEND=jax \
+    python -m delft.applications.grobidTagger date train --architecture BidLSTM_CRF \
+    --embedding glove-840B --max-epoch 3 --early-stop False --batch-size 8 \
+    --crf-loss nll
+
 ## DeLFT Documentation
 
 Visit the [DELFT documentation](https://delft.readthedocs.io) for detailed information on installation, usage and models.
