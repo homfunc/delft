@@ -18,7 +18,7 @@ huggingface_hub>=0.23.0
 safetensors>=0.4.0
 
 # Local editable install of keras3-crf during development
--e ../keras-crf
+# -e ../keras-crf
 
 lmdb
 truecase

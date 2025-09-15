@@ -8,12 +8,11 @@ from keras.layers import GRU, MaxPooling1D, Conv1D, GlobalMaxPool1D, Activation,
 from keras.layers import LSTM, Bidirectional, Dropout, GlobalAveragePooling1D
 from keras.models import Model
 from keras.optimizers import RMSprop
-from transformers import create_optimizer
 
 from delft.textClassification.data_generator import DataGenerator
 from delft.utilities.Embeddings import load_resource_registry
 
-from delft.utilities.Transformer import Transformer, TRANSFORMER_CONFIG_FILE_NAME, DEFAULT_TRANSFORMER_TOKENIZER_DIR
+from delft.utilities.hub_transformer import HubTransformer, HFCompatBackbone
 from delft.utilities.misc import print_parameters
 
 architectures = [
@@ -829,27 +828,32 @@ class bert(BaseModel):
         self.update_parameters(model_config, training_config)
         nb_classes = len(model_config.list_classes)
 
-        transformer_model = self.init_transformer(model_config, load_pretrained_weights=load_pretrained_weights, local_path=local_path)
+        # KerasHub backbone + preprocessor for BERT text classification
+        hub = HubTransformer(model_config.transformer_name, delft_local_path=local_path)
+        preproc = hub.get_preprocessor()
+        self.transformer_tokenizer = preproc
+        backbone = HFCompatBackbone(hub, name='hub_backbone_tc')
 
-        input_ids_in = Input(shape=(None,), name='input_token', dtype='int32')
-        #input_masks_in = Input(shape=(None,), name='masked_token', dtype='int32')
-        #embedding_layer = transformer_model(input_ids_in, attention_mask=input_masks_in)[1]
+        token_ids = Input(shape=(None,), dtype='int32', name='token_ids')
+        segment_ids = Input(shape=(None,), dtype='int32', name='segment_ids')
+        padding_mask = Input(shape=(None,), dtype='int32', name='padding_mask')
 
-        # get the pooler_output as in the original BERT implementation
-        embedding_layer = transformer_model(input_ids_in)[1]
-        cls_out = Dropout(self.parameters["dropout_rate"])(embedding_layer)
+        outputs = backbone({'token_ids': token_ids, 'segment_ids': segment_ids, 'padding_mask': padding_mask})
+        sequence_output = outputs[0]
+
+        # Pooling strategy for classification: mean over valid tokens
+        from keras import ops as K
+        mask_f = K.cast(padding_mask, sequence_output.dtype)
+        sum_vec = K.sum(sequence_output * K.expand_dims(mask_f, -1), axis=1)
+        denom = K.maximum(K.sum(mask_f, axis=1, keepdims=True), K.cast(1, dtype=mask_f.dtype))
+        pooled = sum_vec / denom
+        cls_out = Dropout(self.parameters["dropout_rate"])(pooled)
         logits = Dense(units=nb_classes, activation="softmax")(cls_out)
 
-        self.model = Model(inputs=[input_ids_in], outputs=logits)
-        #self.model = Model(inputs=[input_ids_in, input_masks_in], outputs=logits)
+        self.model = Model(inputs=[token_ids, segment_ids, padding_mask], outputs=logits)
 
 
     def compile(self, train_size):
-        #optimizer = Adam(learning_rate=2e-5, clipnorm=1)
-        optimizer, lr_schedule = create_optimizer(
-                init_lr=self.training_config.learning_rate,
-                num_train_steps=train_size,
-                weight_decay_rate=0.01,
-                num_warmup_steps=0.1 * train_size,
-            )
+        from keras.optimizers import Adam
+        optimizer = Adam(learning_rate=self.training_config.learning_rate)
         self.model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=["accuracy"])

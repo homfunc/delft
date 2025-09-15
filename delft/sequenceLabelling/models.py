@@ -336,8 +336,20 @@ class BaseModel(object):
                     input_chars = chars
                     input_features = text_features
                     input_labels = text_labels
-                    # Build placeholder offsets: we mark non-special tokens with (start>0) is not directly available; use a simple scheme
-                    input_offsets = [[(1,1) for _ in ids] for ids in input_ids]
+                    # Build offsets aligning each subtoken to a unit span; we’ll treat padding_mask==0 as special tokens
+                    pmask = batch.get('padding_mask') or [[1]*len(x) for x in input_ids]
+                    input_offsets = []
+                    for mask_row, ids_row in zip(pmask, input_ids):
+                        row = []
+                        for m in mask_row[:len(ids_row)]:
+                            if m:
+                                row.append((1, 1))
+                            else:
+                                row.append((0, 0))
+                        # pad if necessary
+                        if len(row) < len(ids_row):
+                            row.extend([(0,0)] * (len(ids_row) - len(row)))
+                        input_offsets.append(row)
                     return input_ids, token_type_ids, attention_mask, input_chars, input_features, input_labels, input_offsets
             self.transformer_preprocessor = _KHPreprocessorShim(kh_preproc)
             self.transformer_config = None

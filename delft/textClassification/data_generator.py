@@ -76,14 +76,22 @@ class DataGenerator(keras.utils.Sequence):
                 # for input as word embeddings: 
                 batch_x[i] = to_vector_single(self.x[(index*self.batch_size)+i], self.embeddings, self.maxlen)
         else:
-            # for input as sentence piece token index for BERT layer
-            input_ids, input_masks, input_segments = create_batch_input_bert(self.x[(index*self.batch_size):(index*self.batch_size)+max_iter], 
-                                                                             maxlen=self.maxlen, 
-                                                                             transformer_tokenizer=self.transformer_tokenizer)
-            # we can use only input indices, but could be reconsidered
-            batch_x = np.asarray(input_ids, dtype=np.int32)
-            #batch_x_masks = np.asarray(input_masks, dtype=np.int32)
-            #batch_x_segments = np.asarray(input_segments, dtype=np.int32)
+            # For KerasHub: use its preprocessor to generate token_ids, padding_mask, segment_ids
+            # If x contains tokenized lists already, join them back to strings
+            normalized = [" ".join(t) if isinstance(t, (list, tuple)) else str(t) for t in self.x[(index*self.batch_size):(index*self.batch_size)+max_iter]]
+            if hasattr(self.transformer_tokenizer, '__call__'):
+                batch = self.transformer_tokenizer(normalized)
+                token_ids = batch.get('token_ids') or batch.get('token_ids_0')
+                padding_mask = batch.get('padding_mask')
+                segment_ids = batch.get('segment_ids') or batch.get('segment_ids_0') or [[0]*len(x) for x in token_ids]
+            else:
+                # Fallback to legacy helpers if a genuine HF tokenizer was passed
+                input_ids, input_masks, input_segments = create_batch_input_bert(
+                    normalized, maxlen=self.maxlen, transformer_tokenizer=self.transformer_tokenizer)
+                token_ids, padding_mask, segment_ids = input_ids, input_masks, input_segments
+            # For efficiency of the current classifier, we pass only token_ids
+            batch_x = np.asarray(token_ids, dtype=np.int32)
+            # If/when needed, we can return dict inputs here to match the model signature
 
         # classes are numerical, so nothing to vectorize for y
         for i in range(0, max_iter):
