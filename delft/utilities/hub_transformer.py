@@ -63,11 +63,24 @@ class HubTransformer:
             return self._preprocessor
         self._kh = self._kh or _import_kerashub()
         preset = self._resolve_preset()
-        Preprocessor = getattr(self._kh, "Preprocessor", None)
-        if Preprocessor is None:
-            # Some model families embed tokenization inside task models; fall back to a tokenizer-aware backbone
-            raise RuntimeError("KerasHub Preprocessor autoclass not found. Ensure keras-hub is up to date.")
-        self._preprocessor = Preprocessor.from_preset(preset)
+        # Prefer a task-specific preprocessor when available (e.g., TextClassifierPreprocessor)
+        preproc = None
+        for cls_name in (
+            "TextClassifierPreprocessor",
+            "SequenceTaggerPreprocessor",
+            "Preprocessor",
+        ):
+            PreprocCls = getattr(self._kh, cls_name, None)
+            if PreprocCls is not None:
+                try:
+                    preproc = PreprocCls.from_preset(preset)
+                    break
+                except Exception:
+                    continue
+        if preproc is None:
+            raise RuntimeError(
+                "No suitable KerasHub preprocessor class found. Update keras-hub or choose a compatible preset.")
+        self._preprocessor = preproc
         return self._preprocessor
 
     def get_preprocessor(self):
@@ -98,11 +111,11 @@ class HFCompatBackbone(keras.layers.Layer):
         outputs = self.backbone(inputs, training=training)
         # Try common keys; standardize to (sequence_output,) tuple for minimal compatibility
         if isinstance(outputs, dict):
-            seq = (
-                outputs.get("sequence_output")
-                or outputs.get("encoder_outputs")
-                or outputs.get("hidden_states")
-            )
+            seq = None
+            for key in ("sequence_output", "encoder_outputs", "hidden_states"):
+                if key in outputs:
+                    seq = outputs[key]
+                    break
             if seq is not None:
                 return (seq,)
         # Fallback: return as-is; upstream code should be adjusted to consume dict

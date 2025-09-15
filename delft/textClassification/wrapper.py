@@ -45,8 +45,11 @@ from delft.utilities.Embeddings import Embeddings, load_resource_registry
 from sklearn.metrics import log_loss, roc_auc_score, accuracy_score, f1_score, r2_score, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 
-import transformers
-transformers.logging.set_verbosity(transformers.logging.ERROR) 
+try:
+    import transformers  # type: ignore
+    transformers.logging.set_verbosity(transformers.logging.ERROR) 
+except Exception:
+    transformers = None  # optional; continue without transformers logging
 
 try:
     from keras.utils import plot_model

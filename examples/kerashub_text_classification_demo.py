@@ -86,7 +86,9 @@ valid_gen = DataGenerator(
     transformer_tokenizer=model.transformer_tokenizer,
 )
 
-# Train for a couple epochs (just to verify end-to-end flow)
+# Compile and train for a couple epochs
+from keras.optimizers import Adam
+model.model.compile(optimizer=Adam(learning_rate=training_config.learning_rate), loss='binary_crossentropy', metrics=['accuracy'])
 model.model.fit(train_gen, epochs=training_config.max_epoch)
 
 # Evaluate
