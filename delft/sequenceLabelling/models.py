@@ -12,6 +12,7 @@ from keras.saving import register_keras_serializable
 from delft.sequenceLabelling.config import ModelConfig
 from delft.sequenceLabelling.preprocess import Preprocessor, BERTPreprocessor
 from delft.utilities.Transformer import Transformer
+from delft.utilities.hub_transformer import HubTransformer
 from delft.utilities.crf_wrapper_default import CRFModelWrapperDefault
 from delft.utilities.crf_wrapper_for_bert import CRFModelWrapperForBERT
 from delft.utilities.layers import TakeFirst, ApplyLengthMask, PassMask, ComputeCharLengths, GatherAtIndex
@@ -308,17 +309,51 @@ class BaseModel(object):
                          load_pretrained_weights: bool, 
                          local_path: str,
                          preprocessor: Preprocessor):
-        transformer = Transformer(config.transformer_name, resource_registry=self.registry, delft_local_path=local_path)
-        print(config.transformer_name, "will be used, loaded via", transformer.loading_method)
-        transformer_model = transformer.instantiate_layer(load_pretrained_weights=load_pretrained_weights)
-        self.transformer_config = transformer.transformer_config
-        transformer.init_preprocessor(max_sequence_length=config.max_sequence_length)
+        use_hub = os.environ.get('DELFT_USE_KERASHUB', '0') == '1'
+        if use_hub:
+            print(f"Using KerasHub for transformer: {config.transformer_name}")
+            hub = HubTransformer(config.transformer_name, delft_local_path=local_path)
+            # Preprocessor/tokenizer
+            kh_preproc = hub.get_preprocessor()
+            # Backbone wrapped to return sequence output compatible with tagging
+            from delft.utilities.hub_transformer import HFCompatBackbone
+            transformer_model = HFCompatBackbone(hub, name='hub_backbone')
 
-        self.transformer_preprocessor = BERTPreprocessor(transformer.tokenizer, 
-                                                         preprocessor.empty_features_vector(), 
-                                                         preprocessor.empty_char_vector())
+            # Bridge: define a minimal shim that behaves like our BERTPreprocessor
+            class _KHPreprocessorShim:
+                def __init__(self, kh):
+                    self.kh = kh
+                def tokenize_and_align_features_and_labels(self, texts, chars, text_features, text_labels, maxlen=512):
+                    # KerasHub preprocessors typically accept raw strings; we join tokens when needed
+                    # If texts are tokenized lists, join them back as space-separated strings
+                    normalized = [" ".join(t) if isinstance(t, (list, tuple)) else str(t) for t in texts]
+                    batch = kh_preproc(normalized)
+                    # Extract common fields; provide placeholders to match expected tuple structure
+                    input_ids = batch.get('token_ids') or batch.get('token_ids_0')
+                    token_type_ids = batch.get('segment_ids') or batch.get('segment_ids_0') or [[0]*len(x) for x in input_ids]
+                    attention_mask = batch.get('padding_mask') or [[1]*len(x) for x in input_ids]
+                    # For now, pass-through chars/features/labels; alignment can be refined later
+                    input_chars = chars
+                    input_features = text_features
+                    input_labels = text_labels
+                    # Build placeholder offsets: we mark non-special tokens with (start>0) is not directly available; use a simple scheme
+                    input_offsets = [[(1,1) for _ in ids] for ids in input_ids]
+                    return input_ids, token_type_ids, attention_mask, input_chars, input_features, input_labels, input_offsets
+            self.transformer_preprocessor = _KHPreprocessorShim(kh_preproc)
+            self.transformer_config = None
+            return transformer_model
+        else:
+            transformer = Transformer(config.transformer_name, resource_registry=self.registry, delft_local_path=local_path)
+            print(config.transformer_name, "will be used, loaded via", transformer.loading_method)
+            transformer_model = transformer.instantiate_layer(load_pretrained_weights=load_pretrained_weights)
+            self.transformer_config = transformer.transformer_config
+            transformer.init_preprocessor(max_sequence_length=config.max_sequence_length)
 
-        return transformer_model
+            self.transformer_preprocessor = BERTPreprocessor(transformer.tokenizer, 
+                                                             preprocessor.empty_features_vector(), 
+                                                             preprocessor.empty_char_vector())
+
+            return transformer_model
 
 
 class BidLSTM(BaseModel):

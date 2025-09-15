@@ -7,10 +7,15 @@ regex
 tqdm
 
 # Deep learning backends and APIs
-# Upgrade TF for Keras 3 backend support
-tensorflow>=2.18
-# Use standalone Keras 3 API
+# Keras 3 API (backend-agnostic). Optional TF backend if you choose TensorFlow.
 keras>=3.0.0
+# Optional: TensorFlow backend (remove if using JAX/PyTorch exclusively)
+tensorflow>=2.18
+
+# KerasHub for HF integration without transformers
+keras-hub>=0.2.0
+huggingface_hub>=0.23.0
+safetensors>=0.4.0
 
 # Local editable install of keras3-crf during development
 -e ../keras-crf

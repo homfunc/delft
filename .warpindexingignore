@@ -1,0 +1,8 @@
+.github/
+.gradle/
+.kotlin/
+.vscode/
+build/
+data/db/**
+data/models/*.hdf5
+
