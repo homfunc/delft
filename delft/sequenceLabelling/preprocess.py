@@ -852,7 +852,10 @@ def pad_sequences(sequences, pad_tok=0, nlevels=1, max_char_length=30):
             sequence_padded += [sp]
             sequence_length += [sl]
 
-        max_length_sentence = max(map(lambda x: len(x), sequences))
+        if len(sequences) == 0:
+            max_length_sentence = 0
+        else:
+            max_length_sentence = max(map(lambda x: len(x), sequences))
         sequence_padded, _ = _pad_sequences(sequence_padded, [pad_tok] * max_length_word, max_length_sentence)
         sequence_length, _ = _pad_sequences(sequence_length, 0, max_length_sentence)
     else:

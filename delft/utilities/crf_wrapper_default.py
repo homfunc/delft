@@ -26,11 +26,11 @@ class CRFModelWrapperDefault(Model):
         self.joint_nll_weight = float(joint_nll_weight)
         self.use_kernel = bool(use_kernel)
         self.use_boundary = bool(use_boundary)
-        # cache for last CRF internals to support compute_loss without recompute
-        self._last_crf_tensors = None
         # Instantiate the standard CRF layer from keras3-crf with default internal naming
         # Right-padding compatibility: disable boundaries by default (can be overridden with use_boundary=True)
         self.crf = KCRF(self.num_tags if self.num_tags is not None else 1, name="crf", use_kernel=self.use_kernel, use_boundary=self.use_boundary)
+        # Cache for CRF internals per forward call to avoid recomputation during compute_loss
+        self._crf_cache = None
 
     def build(self, input_shape):
         if not self.base_model.built:
@@ -48,11 +48,11 @@ class CRFModelWrapperDefault(Model):
             decoded, potentials, lengths, trans = self.crf(feats, lengths=seq_lengths)
         else:
             decoded, potentials, lengths, trans = self.crf(feats)
-        # cache tensors for compute_loss
+        # Cache CRF internals for reuse in compute_loss within the same training step
         try:
-            self._last_crf_tensors = (potentials, lengths, trans)
+            self._crf_cache = (potentials, lengths, trans)
         except Exception:
-            self._last_crf_tensors = None
+            self._crf_cache = None
         if return_crf_internal:
             return (potentials, lengths, trans), decoded
         return decoded
@@ -133,41 +133,43 @@ class CRFModelWrapperDefault(Model):
     def compute_loss(self, x=None, y=None, y_pred=None, sample_weight=None):
         # Use cached CRF internals if available; otherwise recompute features and CRF
         potentials = lengths = trans = None
-        if isinstance(self._last_crf_tensors, (list, tuple)):
+        # If call() already computed CRF internals this step, reuse them to avoid recomputation.
+        cached = self._crf_cache
+        feats = self.base_model(x, training=True)
+        # Attempt to pass true lengths during loss computation as well
+        seq_lengths = None
+        try:
+            inps = x
+            if isinstance(inps, dict):
+                seq_lengths = inps.get('length_input', None)
+                if seq_lengths is None:
+                    for v in inps.values():
+                        shape = getattr(v, 'shape', None)
+                        if shape is not None and len(shape) >= 2 and int(shape[-1]) == 1:
+                            seq_lengths = v
+                            break
+            elif isinstance(inps, (list, tuple)) and len(inps) > 0:
+                cand = inps[-1]
+                shape = getattr(cand, 'shape', None)
+                if shape is not None and len(shape) >= 2 and int(shape[-1]) == 1:
+                    seq_lengths = cand
+                else:
+                    for v in inps:
+                        shape = getattr(v, 'shape', None)
+                        if shape is not None and len(shape) >= 2 and int(shape[-1]) == 1:
+                            seq_lengths = v
+                            break
+            if seq_lengths is not None:
+                seq_lengths = _K.cast(_K.squeeze(seq_lengths, axis=-1), 'int32')
+        except Exception:
+            seq_lengths = None
+        potentials = lengths = trans = None
+        if cached is not None:
             try:
-                potentials, lengths, trans = self._last_crf_tensors
+                potentials, lengths, trans = cached
             except Exception:
                 potentials = lengths = trans = None
-        if potentials is None:
-            feats = self.base_model(x, training=True)
-            # Attempt to pass true lengths during loss computation as well
-            seq_lengths = None
-            try:
-                from keras import ops as _K
-                inps = x
-                if isinstance(inps, dict):
-                    seq_lengths = inps.get('length_input', None)
-                    if seq_lengths is None:
-                        for v in inps.values():
-                            shape = getattr(v, 'shape', None)
-                            if shape is not None and len(shape) >= 2 and int(shape[-1]) == 1:
-                                seq_lengths = v
-                                break
-                elif isinstance(inps, (list, tuple)) and len(inps) > 0:
-                    cand = inps[-1]
-                    shape = getattr(cand, 'shape', None)
-                    if shape is not None and len(shape) >= 2 and int(shape[-1]) == 1:
-                        seq_lengths = cand
-                    else:
-                        for v in inps:
-                            shape = getattr(v, 'shape', None)
-                            if shape is not None and len(shape) >= 2 and int(shape[-1]) == 1:
-                                seq_lengths = v
-                                break
-                if seq_lengths is not None:
-                    seq_lengths = _K.cast(_K.squeeze(seq_lengths, axis=-1), 'int32')
-            except Exception:
-                seq_lengths = None
+        if potentials is None or lengths is None or trans is None:
             try:
                 if seq_lengths is not None:
                     try:
@@ -182,6 +184,8 @@ class CRFModelWrapperDefault(Model):
         loss = self.compute_total_loss(potentials, lengths, trans, y, sample_weight)
         if self.losses:
             loss = loss + sum(self.losses)
+        # Clear cache after use to avoid stale references across steps
+        self._crf_cache = None
         return loss
 
     # --- Keras serialization ---

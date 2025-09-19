@@ -344,38 +344,42 @@ class DataGeneratorTransformers(BaseGenerator):
                         use_chain_crf=use_chain_crf,
                         pad_to_max_sequence_length=pad_to_max_sequence_length)
 
-        if self.bert_preprocessor.empty_features_vector is None:
-            self.bert_preprocessor.empty_features_vector = self.preprocessor.empty_features_vector()
+        if self.bert_preprocessor is not None:
+            try:
+                if getattr(self.bert_preprocessor, 'empty_features_vector', None) is None:
+                    self.bert_preprocessor.empty_features_vector = self.preprocessor.empty_features_vector()
+            except Exception:
+                pass
 
         self.on_epoch_end()
 
     def __getitem__(self, index):
         '''
-        Generate one batch of data. These data are the input of the models but can also be used by the training scorer
+        Generate one batch of data. Returns a flat dict of tensors to minimize nested structure
+        processing in Keras tree utilities (helps Torch Dynamo avoid graph breaks).
         '''
         batch_x, batch_x_types, batch_x_masks, batch_c, batch_f, batch_l, batch_input_offsets, batch_y = self.__data_generation(index)
 
-        # careful with the order of data arrays, double-check the models input as defined in models.py before
-        # modifying this
-
-        return_data = [batch_x]
-
-        if self.preprocessor.return_chars:  
-            return_data += [batch_c]
-
-        if self.preprocessor.return_features:  
-            return_data += [batch_f]
-
-        return_data += [batch_x_types]
-
-        return_data += [batch_x_masks]
-
+        inputs = {
+            'input_token': batch_x,
+            'input_token_type': batch_x_types,
+            'input_attention_mask': batch_x_masks,
+        }
+        # Optional auxiliary inputs (rarely used with transformer-only models)
+        if getattr(self.preprocessor, 'return_chars', False):
+            inputs['char_input'] = batch_c
+        if getattr(self.preprocessor, 'return_features', False):
+            inputs['features_input'] = batch_f
+        # Lengths are not required when attention_mask is provided, but include if some
+        # downstream code expects it
+        inputs['length_input'] = batch_l
+        # Offsets are only for post-processing; do not include by default in model inputs
         if self.output_input_offsets:
-            # always last input, used when prediction are done to be able to restore the correct labeled sequence
-            # this is never routed directly to a model input
-            return_data += [batch_input_offsets]
+            # Expose offsets under a non-model key for consumers who index the generator directly.
+            # Keras will ignore unknown keys when mapping to model inputs.
+            inputs['input_offsets'] = batch_input_offsets
 
-        return return_data, batch_y
+        return inputs, batch_y
 
 
     def __data_generation(self, index):
@@ -448,7 +452,7 @@ class DataGeneratorTransformers(BaseGenerator):
         if self.fixed_sequence_length is not None:
             T_target = int(self.fixed_sequence_length)
             # Pad chars to (B, T_target, max_char)
-            if isinstance(batch_c, np.ndarray) and batch_c.shape[1] != T_target:
+            if self.preprocessor.return_chars and isinstance(batch_c, np.ndarray) and batch_c.shape[1] != T_target:
                 Bc, Tc, Cc = batch_c.shape
                 pad_c = np.zeros((Bc, T_target, Cc), dtype=batch_c.dtype)
                 pad_c[:, :min(Tc, T_target), :] = batch_c[:, :min(Tc, T_target), :]

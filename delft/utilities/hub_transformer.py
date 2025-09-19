@@ -2,6 +2,7 @@ import os
 from typing import Any, Dict
 
 import keras
+from keras import ops as K
 
 # KerasHub is the Keras 3-native hub interface. We import lazily to make the
 # module importable even when KerasHub is not installed, but fail early when used.
@@ -91,9 +92,11 @@ class HFCompatBackbone(keras.layers.Layer):
     """
     A small wrapper to present a HF-like call signature to existing DeLFT code.
 
-    Instead of (input_ids, token_type_ids, attention_mask) positional tensors, we accept a dict
-    as produced by KerasHub preprocessors, and return a tuple-like or dict-like output with
-    at least a sequence representation compatible with token-level tagging.
+    Accepts either:
+      - a dict with keys {'token_ids','segment_ids','padding_mask'}
+      - positional inputs (token_ids) with keyword args token_type_ids / attention_mask
+      - a tuple/list of up to 3 tensors in order: (token_ids, segment_ids, padding_mask)
+    Returns a tuple (sequence_output,) for compatibility with legacy code.
     """
 
     def __init__(self, hub: HubTransformer, **kwargs):
@@ -106,9 +109,33 @@ class HFCompatBackbone(keras.layers.Layer):
             self.backbone = self.hub.instantiate_backbone()
         super().build(input_shape)
 
-    def call(self, inputs: Dict[str, Any], training=None):
-        # KerasHub backbones expect a dict with fields like 'token_ids', 'padding_mask', 'segment_ids'
-        outputs = self.backbone(inputs, training=training)
+    def call(self, inputs: Any = None, training=None, **kwargs):
+        batch: Dict[str, Any]
+        # Normalize inputs into a dict with expected KerasHub keys
+        if isinstance(inputs, dict):
+            batch = inputs
+        else:
+            token_ids = None
+            segment_ids = kwargs.get('token_type_ids', None)
+            if segment_ids is None and 'segment_ids' in kwargs:
+                segment_ids = kwargs.get('segment_ids')
+            padding_mask = kwargs.get('attention_mask', None)
+            if padding_mask is None and 'padding_mask' in kwargs:
+                padding_mask = kwargs.get('padding_mask')
+            if isinstance(inputs, (list, tuple)) and len(inputs) > 0:
+                token_ids = inputs[0]
+                if len(inputs) > 1:
+                    segment_ids = inputs[1]
+                if len(inputs) > 2:
+                    padding_mask = inputs[2]
+            else:
+                token_ids = inputs
+            if segment_ids is None and token_ids is not None:
+                segment_ids = K.zeros_like(token_ids)
+            if padding_mask is None and token_ids is not None:
+                padding_mask = K.ones_like(token_ids)
+            batch = {'token_ids': token_ids, 'segment_ids': segment_ids, 'padding_mask': padding_mask}
+        outputs = self.backbone(batch, training=training)
         # Try common keys; standardize to (sequence_output,) tuple for minimal compatibility
         if isinstance(outputs, dict):
             seq = None

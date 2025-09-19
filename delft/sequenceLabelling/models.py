@@ -11,7 +11,6 @@ from keras.saving import register_keras_serializable
 
 from delft.sequenceLabelling.config import ModelConfig
 from delft.sequenceLabelling.preprocess import Preprocessor, BERTPreprocessor
-from delft.utilities.Transformer import Transformer
 from delft.utilities.hub_transformer import HubTransformer
 from delft.utilities.crf_wrapper_default import CRFModelWrapperDefault
 from delft.utilities.crf_wrapper_for_bert import CRFModelWrapperForBERT
@@ -305,67 +304,118 @@ class BaseModel(object):
             base.summary(expand_nested=True)
         self.model.summary(expand_nested=True)
 
-    def init_transformer(self, config: ModelConfig, 
-                         load_pretrained_weights: bool, 
+    def init_transformer(self, config: ModelConfig,
+                         load_pretrained_weights: bool,
                          local_path: str,
                          preprocessor: Preprocessor):
-        use_hub = os.environ.get('DELFT_USE_KERASHUB', '0') == '1'
-        if use_hub:
-            print(f"Using KerasHub for transformer: {config.transformer_name}")
-            hub = HubTransformer(config.transformer_name, delft_local_path=local_path)
-            # Preprocessor/tokenizer
-            kh_preproc = hub.get_preprocessor()
-            # Backbone wrapped to return sequence output compatible with tagging
-            from delft.utilities.hub_transformer import HFCompatBackbone
-            transformer_model = HFCompatBackbone(hub, name='hub_backbone')
+        # Always use KerasHub for transformer models
+        print(f"Using KerasHub for transformer: {config.transformer_name}")
+        hub = HubTransformer(config.transformer_name, delft_local_path=local_path)
+        # Preprocessor/tokenizer
+        kh_preproc = hub.get_preprocessor()
+        # Backbone wrapped to return sequence output compatible with tagging
+        from delft.utilities.hub_transformer import HFCompatBackbone
+        transformer_model = HFCompatBackbone(hub, name='hub_backbone')
 
-            # Bridge: define a minimal shim that behaves like our BERTPreprocessor
-            class _KHPreprocessorShim:
-                def __init__(self, kh):
-                    self.kh = kh
-                def tokenize_and_align_features_and_labels(self, texts, chars, text_features, text_labels, maxlen=512):
-                    # KerasHub preprocessors typically accept raw strings; we join tokens when needed
-                    # If texts are tokenized lists, join them back as space-separated strings
-                    normalized = [" ".join(t) if isinstance(t, (list, tuple)) else str(t) for t in texts]
-                    batch = kh_preproc(normalized)
-                    # Extract common fields; provide placeholders to match expected tuple structure
-                    input_ids = batch.get('token_ids') or batch.get('token_ids_0')
-                    token_type_ids = batch.get('segment_ids') or batch.get('segment_ids_0') or [[0]*len(x) for x in input_ids]
-                    attention_mask = batch.get('padding_mask') or [[1]*len(x) for x in input_ids]
-                    # For now, pass-through chars/features/labels; alignment can be refined later
-                    input_chars = chars
-                    input_features = text_features
-                    input_labels = text_labels
-                    # Build offsets aligning each subtoken to a unit span; we’ll treat padding_mask==0 as special tokens
-                    pmask = batch.get('padding_mask') or [[1]*len(x) for x in input_ids]
-                    input_offsets = []
-                    for mask_row, ids_row in zip(pmask, input_ids):
-                        row = []
-                        for m in mask_row[:len(ids_row)]:
-                            if m:
-                                row.append((1, 1))
+        # Bridge: define a minimal shim that behaves like our BERTPreprocessor
+        class _KHPreprocessorShim:
+            def __init__(self, kh, preprocessor_obj):
+                self.kh = kh
+                # supply empty vectors expected by DataGeneratorTransformers
+                try:
+                    self.empty_features_vector = preprocessor_obj.empty_features_vector()
+                except Exception:
+                    self.empty_features_vector = []
+                try:
+                    self.empty_char_vector = preprocessor_obj.empty_char_vector()
+                except Exception:
+                    self.empty_char_vector = []
+
+            def tokenize_and_align_features_and_labels(self, texts, chars, text_features, text_labels, maxlen=512):
+                # KerasHub preprocessors typically accept raw strings; we join tokens when needed
+                # If texts are tokenized lists, join them back as space-separated strings
+                normalized = [" ".join(t) if isinstance(t, (list, tuple)) else str(t) for t in texts]
+                batch = self.kh(normalized)
+                # Extract common fields; provide placeholders to match expected tuple structure
+                input_ids = batch['token_ids'] if 'token_ids' in batch else batch.get('token_ids_0')
+                token_type_ids = None
+                if 'segment_ids' in batch:
+                    token_type_ids = batch['segment_ids']
+                elif 'segment_ids_0' in batch:
+                    token_type_ids = batch['segment_ids_0']
+                if token_type_ids is None and input_ids is not None:
+                    token_type_ids = [[0] * len(x) for x in input_ids]
+                attention_mask = batch['padding_mask'] if 'padding_mask' in batch else ([[1] * len(x) for x in input_ids] if input_ids is not None else None)
+                # Prepare padding mask array for alignment and offsets
+                pmask = batch['padding_mask'] if 'padding_mask' in batch else ([[1] * len(x) for x in input_ids] if input_ids is not None else [])
+
+                # Align labels to sub-tokenization with B/I propagation across sub-tokens.
+                input_chars = chars
+                input_features = text_features
+                input_labels = []
+                ids_iter = input_ids if input_ids is not None else []
+                labels_list = text_labels if text_labels is not None else ([[]] * (len(input_ids) if input_ids is not None else 0))
+                pmask_iter = pmask if pmask is not None else []
+                for ids_row, labels_row, mask_row in zip(ids_iter, labels_list, pmask_iter):
+                    # valid token positions
+                    mask_idx = [k for k, m in enumerate(mask_row[:len(ids_row)]) if bool(m)]
+                    # choose first len(labels_row) as word starts
+                    try:
+                        lr = list(labels_row)
+                    except Exception:
+                        lr = labels_row
+                    starts = mask_idx[:len(lr)] if lr else []
+                    # build spans between consecutive starts
+                    spans = []
+                    for j, s in enumerate(starts):
+                        e = mask_idx[mask_idx.index(s) + 1] if (j + 1) < len(starts) else (mask_idx[-1] + 1 if mask_idx else s + 1)
+                        spans.append((s, min(e, len(ids_row))))
+                    aligned = ["O"] * len(ids_row)
+                    for (j, (s, e)) in enumerate(spans):
+                        lab = lr[j]
+                        if lab == "O":
+                            for t in range(s, e):
+                                aligned[t] = "O"
+                        else:
+                            # Normalize to B-/I- form
+                            if "-" in lab:
+                                pref, typ = lab.split("-", 1)
                             else:
-                                row.append((0, 0))
-                        # pad if necessary
-                        if len(row) < len(ids_row):
-                            row.extend([(0,0)] * (len(ids_row) - len(row)))
-                        input_offsets.append(row)
-                    return input_ids, token_type_ids, attention_mask, input_chars, input_features, input_labels, input_offsets
-            self.transformer_preprocessor = _KHPreprocessorShim(kh_preproc)
-            self.transformer_config = None
-            return transformer_model
-        else:
-            transformer = Transformer(config.transformer_name, resource_registry=self.registry, delft_local_path=local_path)
-            print(config.transformer_name, "will be used, loaded via", transformer.loading_method)
-            transformer_model = transformer.instantiate_layer(load_pretrained_weights=load_pretrained_weights)
-            self.transformer_config = transformer.transformer_config
-            transformer.init_preprocessor(max_sequence_length=config.max_sequence_length)
+                                pref, typ = "B", lab
+                            for t in range(s, e):
+                                aligned[t] = ("B-" + typ) if t == s else ("I-" + typ)
+                    input_labels.append(aligned)
 
-            self.transformer_preprocessor = BERTPreprocessor(transformer.tokenizer, 
-                                                             preprocessor.empty_features_vector(), 
-                                                             preprocessor.empty_char_vector())
+                # Offsets: mark only word starts (first subtoken) as (1,1), subs/specials as (0,0)
+                input_offsets = []
+                for labels_row, mask_row, ids_row in zip(labels_list, pmask_iter, ids_iter):
+                    row = []
+                    mask_slice = mask_row[:len(ids_row)]
+                    # When labels are not provided (e.g., during prediction), mark all valid positions as starts
+                    if labels_row is None or (hasattr(labels_row, '__len__') and len(labels_row) == 0):
+                        for i, m in enumerate(mask_slice):
+                            row.append((1,1) if bool(m) else (0,0))
+                    else:
+                        mask_idx = [k for k, m in enumerate(mask_slice) if bool(m)]
+                        try:
+                            lab_len = int(len(labels_row))
+                        except Exception:
+                            lab_len = 0
+                        starts = set(mask_idx[:lab_len]) if lab_len > 0 else set()
+                        for i, m in enumerate(mask_slice):
+                            row.append((1,1) if (bool(m) and i in starts) else (0,0))
+                    if len(row) < len(ids_row):
+                        row.extend([(0,0)] * (len(ids_row)-len(row)))
+                    input_offsets.append(row)
+                return input_ids, token_type_ids, attention_mask, input_chars, input_features, input_labels, input_offsets
 
-            return transformer_model
+        # Attach shim to this model instance for downstream generators
+        try:
+            self.transformer_preprocessor = _KHPreprocessorShim(kh_preproc, preprocessor)
+        except Exception:
+            self.transformer_preprocessor = None
+        self.transformer_config = None
+        return transformer_model
 
 
 class BidLSTM(BaseModel):
