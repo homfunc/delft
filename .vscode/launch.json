@@ -1,0 +1,54 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Python Debugger: Module",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "delft.applications.grobidTagger",
+            "args": ["citation", "tag", "--architecture", "BidLSTM_CRF"]
+        },
+        {
+            "name": "DeLFT train_eval grobid-date",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/m_thing/.local/share/mamba/envs/kaggle/bin/python",
+            "module": "delft.applications.grobidTagger",
+            "args": ["date", "train_eval", "--architecture", "BidLSTM_CRF",
+             "--embedding", "glove-840B", "--early-stop", "False"],
+            "env": {
+                "KERAS_BACKEND": "tensorflow"
+            }
+        },
+        {
+            "name": "DeLFT eval grobid-date",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/m_thing/.local/share/mamba/envs/kaggle/bin/python",
+            "module": "delft.applications.grobidTagger",
+            "args": ["date", "eval", "--architecture", "BidLSTM_CRF",
+             "--embedding", "glove-840B", "--input", "./data/sequenceLabelling/grobid/date/date-110322.train"],
+            "env": {
+                "KERAS_BACKEND": "tensorflow"
+            }
+        },
+        {
+            "name": "DeLFT create and save grobid-date",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/m_thing/.local/share/mamba/envs/kaggle/bin/python",
+            "program": "./scripts/create_and_save_sequence_model.py",
+            "cwd": "${workspaceFolder}",
+            "args": ["--model-name", "grobid-date-BidLSTM_CRF",
+                "--input", "./data/sequenceLabelling/grobid/date/date-110322.train",
+                "--out", "./export/", "--limit", "10"],
+            "env": {
+                "KERAS_BACKEND": "tensorflow"
+            }
+        }
+    ]
+}

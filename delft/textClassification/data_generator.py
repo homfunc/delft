@@ -56,7 +56,16 @@ class DataGenerator(keras.utils.Sequence):
 
         # other shuffle dataset for next epoch
         if self.shuffle:
-            self.x, self.y, _ = shuffle_triple_with_view(self.x, self.y)
+            # Accept Python lists or numpy arrays
+            try:
+                self.x, self.y, _ = shuffle_triple_with_view(self.x, self.y)
+            except Exception:
+                import numpy as _np
+                x_arr = _np.asarray(self.x, dtype=object)
+                y_arr = _np.asarray(self.y, dtype=object)
+                x_arr, y_arr, _ = shuffle_triple_with_view(x_arr, y_arr)
+                self.x = list(x_arr)
+                self.y = list(y_arr)
 
     def __data_generation(self, index):
         """
@@ -66,6 +75,8 @@ class DataGenerator(keras.utils.Sequence):
 
         if not self.bert_data:
             batch_x = np.zeros((max_iter, self.maxlen, self.embeddings.embed_size), dtype='float32')
+        else:
+            batch_x = None  # Will become a dict of arrays for KerasHub inputs
         batch_y = None
         if self.y is not None:
             batch_y = np.zeros((max_iter, len(self.list_classes)), dtype='float32')
@@ -76,14 +87,33 @@ class DataGenerator(keras.utils.Sequence):
                 # for input as word embeddings: 
                 batch_x[i] = to_vector_single(self.x[(index*self.batch_size)+i], self.embeddings, self.maxlen)
         else:
-            # for input as sentence piece token index for BERT layer
-            input_ids, input_masks, input_segments = create_batch_input_bert(self.x[(index*self.batch_size):(index*self.batch_size)+max_iter], 
-                                                                             maxlen=self.maxlen, 
-                                                                             transformer_tokenizer=self.transformer_tokenizer)
-            # we can use only input indices, but could be reconsidered
-            batch_x = np.asarray(input_ids, dtype=np.int32)
-            #batch_x_masks = np.asarray(input_masks, dtype=np.int32)
-            #batch_x_segments = np.asarray(input_segments, dtype=np.int32)
+            # For KerasHub: use its preprocessor to generate token_ids, padding_mask, segment_ids
+            # If x contains tokenized lists already, join them back to strings
+            normalized = [" ".join(t) if isinstance(t, (list, tuple)) else str(t) for t in self.x[(index*self.batch_size):(index*self.batch_size)+max_iter]]
+            if hasattr(self.transformer_tokenizer, '__call__'):
+                batch = self.transformer_tokenizer(normalized)
+                token_ids = batch.get('token_ids') if 'token_ids' in batch else batch.get('token_ids_0')
+                padding_mask = batch.get('padding_mask') if 'padding_mask' in batch else None
+                segment_ids = None
+                if 'segment_ids' in batch:
+                    segment_ids = batch.get('segment_ids')
+                elif 'segment_ids_0' in batch:
+                    segment_ids = batch.get('segment_ids_0')
+                if segment_ids is None and token_ids is not None:
+                    segment_ids = [[0]*len(x) for x in token_ids]
+                if padding_mask is None and token_ids is not None:
+                    padding_mask = [[1]*len(x) for x in token_ids]
+            else:
+                # Fallback to legacy helpers if a genuine HF tokenizer was passed
+                input_ids, input_masks, input_segments = create_batch_input_bert(
+                    normalized, maxlen=self.maxlen, transformer_tokenizer=self.transformer_tokenizer)
+                token_ids, padding_mask, segment_ids = input_ids, input_masks, input_segments
+            # Return dict inputs expected by the KerasHub-based model
+            batch_x = {
+                'token_ids': np.asarray(token_ids, dtype=np.int32),
+                'segment_ids': np.asarray(segment_ids, dtype=np.int32),
+                'padding_mask': np.asarray(padding_mask, dtype=np.int32),
+            }
 
         # classes are numerical, so nothing to vectorize for y
         for i in range(0, max_iter):

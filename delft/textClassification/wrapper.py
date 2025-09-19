@@ -38,15 +38,12 @@ from delft.textClassification.models import train_folds
 from delft.textClassification.models import predict_folds
 from delft.textClassification.data_generator import DataGenerator
 
-from delft.utilities.Transformer import Transformer, TRANSFORMER_CONFIG_FILE_NAME, DEFAULT_TRANSFORMER_TOKENIZER_DIR
 
 from delft.utilities.Embeddings import Embeddings, load_resource_registry
 
 from sklearn.metrics import log_loss, roc_auc_score, accuracy_score, f1_score, r2_score, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 
-import transformers
-transformers.logging.set_verbosity(transformers.logging.ERROR) 
 
 try:
     from keras.utils import plot_model

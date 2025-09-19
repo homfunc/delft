@@ -5,7 +5,6 @@ from packaging import version
 
 from delft import DELFT_PROJECT_DIR
 # ask tensorflow to be quiet and not print hundred lines of logs
-from delft.utilities.Transformer import TRANSFORMER_CONFIG_FILE_NAME, DEFAULT_TRANSFORMER_TOKENIZER_DIR
 from delft.utilities.misc import print_parameters
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'

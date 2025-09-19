@@ -5,7 +5,6 @@ import keras
 from keras.callbacks import Callback, EarlyStopping, ModelCheckpoint
 from keras import ops as K
 from keras import backend as Kb
-from transformers import create_optimizer
 
 from delft.sequenceLabelling.config import ModelConfig
 from delft.sequenceLabelling.data_generator import DataGeneratorTransformers
@@ -13,7 +12,6 @@ from delft.sequenceLabelling.evaluation import f1_score, accuracy_score, precisi
 from delft.sequenceLabelling.evaluation import get_report, compute_metrics
 from delft.sequenceLabelling.models import get_model
 from delft.sequenceLabelling.preprocess import Preprocessor
-from delft.utilities.Transformer import TRANSFORMER_CONFIG_FILE_NAME, DEFAULT_TRANSFORMER_TOKENIZER_DIR
 from delft.utilities.misc import print_parameters
 
 DEFAULT_WEIGHT_FILE_NAME = 'model_weights.hdf5'
@@ -74,12 +72,21 @@ class Trainer(object):
         
         if self.model_config.transformer_name is not None:
             # we use a transformer layer in the architecture
-            optimizer, lr_schedule = create_optimizer(
-                init_lr=self.training_config.learning_rate,
-                num_train_steps=nb_train_steps,
-                weight_decay_rate=0.01,
-                num_warmup_steps=0.1 * nb_train_steps,
-            )
+            try:
+                from transformers import create_optimizer  # type: ignore
+                optimizer, lr_schedule = create_optimizer(
+                    init_lr=self.training_config.learning_rate,
+                    num_train_steps=nb_train_steps,
+                    weight_decay_rate=0.01,
+                    num_warmup_steps=int(0.1 * nb_train_steps),
+                )
+            except Exception:
+                # Fallback to a reasonable Adam setup if transformers is unavailable
+                lr_schedule = keras.optimizers.schedules.ExponentialDecay(
+                    initial_learning_rate=self.training_config.learning_rate,
+                    decay_steps=max(nb_train_steps, 1),
+                    decay_rate=0.1)
+                optimizer = keras.optimizers.Adam(learning_rate=lr_schedule)
 
             if local_model.config.use_chain_crf:
                 local_model.compile(

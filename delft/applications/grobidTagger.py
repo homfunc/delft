@@ -6,7 +6,7 @@ import time
 
 from sklearn.model_selection import train_test_split
 
-from delft.sequenceLabelling import Sequence
+from delft.sequenceLabelling.wrapper import Sequence
 from delft.sequenceLabelling.reader import load_data_and_labels_crf_file
 from delft.utilities.Utilities import longest_row, t_or_f
 
