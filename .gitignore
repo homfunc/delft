@@ -12,6 +12,7 @@ target
 *.obj
 *.zip
 *.gz
+.vscode/
 !data/textClassification/software/*.gz
 !data/sequenceLabelling/grobid/fulltext/fulltext-110322.train.gz
 data/db/*
